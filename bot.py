@@ -115,9 +115,9 @@ class AnnounceChannelPicker(discord.ui.View):
 # =========================
 @bot.event
 async def on_ready():
-    # Sync slash commands globally (can take a bit to appear the first time)
-    await bot.tree.sync()
-    print(f"Logged in as {bot.user}")
+    guild = discord.Object(id=YOUR_SERVER_ID_HERE)
+    await bot.tree.sync(guild=guild)
+    print(f"Logged in as {bot.user} (guild synced)")
 
 @bot.tree.command(name="ping", description="Check if the FEC bot is online.")
 async def ping(interaction: discord.Interaction):
