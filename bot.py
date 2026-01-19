@@ -90,36 +90,75 @@ async def on_ready():
 
 
 # =========================
-# UI: CHANNEL PICKER
+# UI: CHANNEL PICKER (MANUAL OPTIONS)
 # =========================
-class AnnounceChannelSelect(discord.ui.ChannelSelect):
-    def __init__(self, title: str, message: str):
+
+def get_bot_member(guild: discord.Guild) -> discord.Member | None:
+    if bot.user is None:
+        return None
+    return guild.get_member(bot.user.id)
+
+def eligible_announce_channels(guild: discord.Guild) -> list[discord.TextChannel]:
+    bot_member = get_bot_member(guild)
+    if bot_member is None:
+        return []
+
+    eligible: list[discord.TextChannel] = []
+    for ch in guild.text_channels:
+        # Only allow specific channels by name (your allowlist)
+        if ch.name not in ALLOWED_ANNOUNCE_CHANNELS:
+            continue
+
+        perms = ch.permissions_for(bot_member)
+        if perms.view_channel and perms.send_messages:
+            eligible.append(ch)
+
+    return eligible
+
+
+class AnnounceChannelSelect(discord.ui.Select):
+    def __init__(self, title: str, message: str, channels: list[discord.TextChannel]):
+        options = [
+            discord.SelectOption(
+                label=f"#{ch.name}",
+                value=str(ch.id),
+                description=f"Post in {ch.guild.name}"
+            )
+            for ch in channels[:25]  # Discord select options max is 25
+        ]
+
         super().__init__(
             placeholder="Select the channel for this announcement:",
-            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
             min_values=1,
             max_values=1,
+            options=options,
         )
+
         self.title = title
         self.message = message
 
     async def callback(self, interaction: discord.Interaction):
         try:
-            chosen_channel = self.values[0]
-
-            # Safety: ensure guild exists
             if interaction.guild is None:
-                await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+                await interaction.response.send_message(
+                    "❌ This command can only be used in a server.",
+                    ephemeral=True
+                )
                 return
 
-            # Only allow specific channels by name
+            channel_id = int(self.values[0])
+            chosen_channel = interaction.guild.get_channel(channel_id)
+
+            if not isinstance(chosen_channel, discord.TextChannel):
+                await interaction.response.send_message("❌ Invalid channel selection.", ephemeral=True)
+                return
+
+            # Double-check allowlist (extra safety)
             if chosen_channel.name not in ALLOWED_ANNOUNCE_CHANNELS:
                 case_ref = make_case_reference()
                 await interaction.response.send_message(
-                    f"❌ That channel isn’t authorized for FEC announcements.\n"
-                    f"Allowed: {', '.join(sorted(ALLOWED_ANNOUNCE_CHANNELS))}\n"
-                    f"Case Reference: `{case_ref}`",
-                    ephemeral=True,
+                    f"❌ That channel isn’t authorized.\nCase: `{case_ref}`",
+                    ephemeral=True
                 )
                 await log_event(
                     interaction.guild,
@@ -130,11 +169,9 @@ class AnnounceChannelSelect(discord.ui.ChannelSelect):
                 )
                 return
 
-            # Post announcement
             content = f"{fmt_header(self.title)}\n\n{self.message}"
             await chosen_channel.send(content)
 
-            # Confirm + log
             await interaction.response.send_message("✅ Announcement posted.", ephemeral=True)
             await log_event(
                 interaction.guild,
@@ -159,9 +196,10 @@ class AnnounceChannelSelect(discord.ui.ChannelSelect):
 
 
 class AnnounceChannelPicker(discord.ui.View):
-    def __init__(self, title: str, message: str):
+    def __init__(self, title: str, message: str, channels: list[discord.TextChannel]):
         super().__init__(timeout=300)
-        self.add_item(AnnounceChannelSelect(title, message))
+        self.add_item(AnnounceChannelSelect(title, message, channels))
+
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
         print("=== VIEW ERROR START ===")
