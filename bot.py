@@ -79,31 +79,47 @@ class AnnounceChannelSelect(discord.ui.ChannelSelect):
             channel_types=[discord.ChannelType.text]
         )
 
-    async def callback(self, interaction: discord.Interaction):
-        chosen_channel = self.values[0]  # a TextChannel
+async def callback(self, interaction: discord.Interaction):
+    chosen_channel = self.values[0]
 
-        # Optional restriction
-        if ALLOWED_ANNOUNCE_CHANNELS and chosen_channel.name not in ALLOWED_ANNOUNCE_CHANNELS:
-            allowed_fmt = ", ".join(f"#{name}" for name in ALLOWED_ANNOUNCE_CHANNELS)
-            await interaction.response.send_message(
-                f"❌ That channel isn’t authorized for FEC announcements.\n"
-                f"Allowed channels: {allowed_fmt}",
-                ephemeral=True
-            )
-            return
+    # ACK the interaction immediately so it doesn't expire
+    await interaction.response.defer(ephemeral=True, thinking=True)
 
-        # Post the house-style announcement
-        formatted = house_style_announcement(self.announcement_title, self.announcement_message)
-        await chosen_channel.send(formatted)
-
-        await interaction.response.send_message(
-            f"✅ Announcement posted in {chosen_channel.mention}.",
+    # Optional restriction
+    if ALLOWED_ANNOUNCE_CHANNELS and chosen_channel.name not in ALLOWED_ANNOUNCE_CHANNELS:
+        allowed_fmt = ", ".join(f"#{name}" for name in ALLOWED_ANNOUNCE_CHANNELS)
+        await interaction.followup.send(
+            f"❌ That channel isn’t authorized for FEC announcements.\n"
+            f"Allowed channels: {allowed_fmt}",
             ephemeral=True
         )
+        return
 
-        # Stop the view after success
-        if self.view:
-            self.view.stop()
+    formatted = house_style_announcement(self.announcement_title, self.announcement_message)
+
+    try:
+        await chosen_channel.send(formatted)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            f"❌ I don’t have permission to post in {chosen_channel.mention}.\n"
+            "Needed: View Channel + Send Messages (and Publish Messages if it’s an announcement channel).",
+            ephemeral=True
+        )
+        return
+    except discord.HTTPException as e:
+        await interaction.followup.send(
+            f"❌ Discord API error while posting: `{e}`",
+            ephemeral=True
+        )
+        return
+
+    await interaction.followup.send(
+        f"✅ Announcement posted in {chosen_channel.mention}.",
+        ephemeral=True
+    )
+
+    if self.view:
+        self.view.stop()
 
 class AnnounceChannelPicker(discord.ui.View):
     def __init__(self, title: str, message: str):
