@@ -80,13 +80,13 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    # Sync slash commands (global). Can take a bit to propagate on Discord.
     try:
         synced = await bot.tree.sync()
-        print(f"[READY] Synced {len(synced)} command(s). Logged in as {bot.user}")
+        print(f"✅ Synced {len(synced)} commands.")
     except Exception as e:
-        print("[READY] Sync failed:", repr(e))
-    print(f"[READY] Bot online: {bot.user}")
+        print(f"❌ Command sync failed: {e}")
+    print(f"Logged in as {bot.user}")
+
 
 
 # =========================
