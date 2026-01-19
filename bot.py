@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands
 from datetime import datetime
 import random
+import traceback
 
 # =========================
 # CONFIG (edit these)
@@ -68,15 +69,29 @@ async def log_unauthorized_attempt(
 # =========================
 # UI: Channel picker
 # =========================
-class AnnounceChannelSelect(discord.ui.ChannelSelect):
+class AnnounceChannelPicker(discord.ui.View):
     def __init__(self, title: str, message: str):
-        self.announcement_title = title
-        self.announcement_message = message
-        super().__init__(
-            placeholder="Select a channel to post the announcement…",
-            min_values=1,
-            max_values=1,
-            channel_types=[discord.ChannelType.text]
+        super().__init__(timeout=300)
+        self.add_item(AnnounceChannelSelect(title, message))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
+        print("=== UI ERROR START ===")
+        traceback.print_exception(type(error), error, error.__traceback__)
+        print("=== UI ERROR END ===")
+
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "❌ Selection failed. The error was logged.",
+                    ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "❌ Selection failed. The error was logged.",
+                    ephemeral=True
+                )
+        except Exception:
+            pass
         )
 
 async def callback(self, interaction: discord.Interaction):
@@ -131,9 +146,8 @@ class AnnounceChannelPicker(discord.ui.View):
 # =========================
 @bot.event
 async def on_ready():
-    guild = discord.Object(id=1419829129573957724)
-    await bot.tree.sync(guild=guild)
-    print(f"Logged in as {bot.user} (guild synced)")
+    print("FEC BOT VERSION: 2026-01-19-A (dropdown debug)")
+    print(f"Logged in as {bot.user}")
 
 @bot.tree.command(name="ping", description="Check if the FEC bot is online.")
 async def ping(interaction: discord.Interaction):
