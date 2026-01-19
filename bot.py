@@ -115,7 +115,7 @@ class AnnounceChannelPicker(discord.ui.View):
 # =========================
 @bot.event
 async def on_ready():
-    guild = discord.Object(id=YOUR_SERVER_ID_HERE)
+    guild = discord.Object(id=1419829129573957724)
     await bot.tree.sync(guild=guild)
     print(f"Logged in as {bot.user} (guild synced)")
 
