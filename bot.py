@@ -161,8 +161,32 @@ async def announce(interaction: discord.Interaction, title: str, message: str):
     )
 
 # =========================
-# RUN
+# RUN (Render-safe)
 # =========================
 import os
-bot.run(os.getenv("DISCORD_TOKEN"))
+import asyncio
+import discord
+
+async def runner():
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise RuntimeError("DISCORD_TOKEN env var is missing.")
+
+    backoff = 10  # seconds
+    while True:
+        try:
+            async with bot:
+                await bot.start(token)
+        except discord.HTTPException as e:
+            # If Discord/Cloudflare blocks the host, don't crash/restart rapidly
+            print(f"[HTTPException] {e} — backing off {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 600)  # cap at 10 minutes
+            continue
+        except Exception as e:
+            print(f"[Fatal] {e}")
+            raise
+
+if __name__ == "__main__":
+    asyncio.run(runner())
 
