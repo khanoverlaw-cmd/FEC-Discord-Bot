@@ -92,9 +92,9 @@ class AnnounceChannelPicker(discord.ui.View):
                 )
         except Exception:
             pass
-        )
+        
 
-async def callback(self, interaction: discord.Interaction):
+    async def callback(self, interaction: discord.Interaction):
     chosen_channel = self.values[0]
 
     # ACK the interaction immediately so it doesn't expire
