@@ -6,8 +6,8 @@ import random
 # =========================
 # CONFIG (edit these)
 # =========================
-FEC_ROLE_NAME = "The Federal Election Commission"  # EXACT role name (case-sensitive)
-LOG_CHANNEL_NAME = "interaction-log"               # EXACT channel name (case-sensitive)
+FEC_ROLE_ID = 1462754795684233343  # paste the number, no quotes
+LOG_CHANNEL_NAME = "interaction-logs"               # EXACT channel name (case-sensitive)
 
 # Only allow posting into these channels (by channel NAME, not #mention)
 ALLOWED_ANNOUNCE_CHANNELS = [
@@ -22,7 +22,7 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 def has_fec_role(member: discord.Member) -> bool:
-    return any(role.name == FEC_ROLE_NAME for role in member.roles)
+    return any(role.id == FEC_ROLE_ID for role in member.roles)
 
 def generate_case_number() -> str:
     # Example: FEC-26-0119-4821 (YY-MMDD-RAND)
