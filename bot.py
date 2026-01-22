@@ -13,7 +13,8 @@ from discord.ext import commands
 FEC_ROLE_ID = 1462754795684233343  # replace with the actual role ID
 LOG_CHANNEL_NAME = "interaction-logs"
 
-ALLOWED_ANNOUNCE_CHANNELS = {"fec-announcements", "election results", "fec-public-records"}
+# Discord channel names cannot contain spaces; use hyphens.
+ALLOWED_ANNOUNCE_CHANNELS = {"fec-announcements", "election-results", "fec-public-records"}
 
 # Optional: if you want a specific emoji name like :FEC:
 # The message format will still work even if the emoji doesn't exist, it’ll just display text.
@@ -57,7 +58,6 @@ def user_has_fec_role(member: discord.Member) -> bool:
     return any(role.id == FEC_ROLE_ID for role in member.roles)
 
 
-
 def unauthorized_notice(case_ref: str) -> str:
     return (
         "⚠️ **FEC NOTICE — UNAUTHORIZED ELECTION ACTIVITY**\n\n"
@@ -88,15 +88,15 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
 
 
-
 # =========================
 # UI: CHANNEL PICKER (MANUAL OPTIONS)
 # =========================
-
 def get_bot_member(guild: discord.Guild) -> discord.Member | None:
+    """More reliable than interaction.guild.me in some setups."""
     if bot.user is None:
         return None
     return guild.get_member(bot.user.id)
+
 
 def eligible_announce_channels(guild: discord.Guild) -> list[discord.TextChannel]:
     bot_member = get_bot_member(guild)
@@ -122,7 +122,7 @@ class AnnounceChannelSelect(discord.ui.Select):
             discord.SelectOption(
                 label=f"#{ch.name}",
                 value=str(ch.id),
-                description=f"Post in {ch.guild.name}"
+                description="Approved FEC channel",
             )
             for ch in channels[:25]  # Discord select options max is 25
         ]
@@ -200,7 +200,6 @@ class AnnounceChannelPicker(discord.ui.View):
         super().__init__(timeout=300)
         self.add_item(AnnounceChannelSelect(title, message, channels))
 
-
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
         print("=== VIEW ERROR START ===")
         traceback.print_exception(type(error), error, error.__traceback__)
@@ -219,7 +218,11 @@ class AnnounceChannelPicker(discord.ui.View):
 # =========================
 @bot.tree.command(name="ping", description="Check if the FEC bot is online.")
 async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("✅ Online.", ephemeral=True)
+    # Prevents "Interaction has already been acknowledged" (40060) from crashing the command.
+    if interaction.response.is_done():
+        await interaction.followup.send("✅ Online.", ephemeral=True)
+    else:
+        await interaction.response.send_message("✅ Online.", ephemeral=True)
 
 
 @bot.tree.command(name="announce", description="Post an FEC-formatted announcement to an approved channel.")
@@ -245,10 +248,26 @@ async def announce(interaction: discord.Interaction, title: str, message: str):
         )
         return
 
-    # Send picker UI
-    await interaction.response.send_message(
+    # Defer quickly so Discord never times out (helps with Render cold starts / lag)
+    await interaction.response.defer(ephemeral=True)
+
+    # Build eligible channel list and guard
+    channels = eligible_announce_channels(interaction.guild)
+
+    if not channels:
+        await interaction.followup.send(
+            "❌ No approved announcement channels found that I can post in.\n\n"
+            f"Approved channel names: {', '.join(sorted(ALLOWED_ANNOUNCE_CHANNELS))}\n"
+            "Fix: make sure those channels exist (exact names) and that I have **View Channel** + "
+            "**Send Messages** permissions in them.",
+            ephemeral=True
+        )
+        return
+
+    # Send picker UI (as followup because we deferred)
+    await interaction.followup.send(
         "Select the channel for this announcement:",
-        view=AnnounceChannelPicker(title, message),
+        view=AnnounceChannelPicker(title, message, channels),
         ephemeral=True
     )
 
