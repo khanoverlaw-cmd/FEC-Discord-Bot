@@ -6,6 +6,7 @@ from datetime import datetime, UTC
 
 import discord
 from discord.ext import commands
+from discord import app_commands
 
 # =========================
 # CONFIG
@@ -13,12 +14,15 @@ from discord.ext import commands
 FEC_ROLE_ID = 1462754795684233343  # replace with the actual role ID
 LOG_CHANNEL_NAME = "interaction-logs"
 
-# Discord channel names cannot contain spaces; use hyphens.
+# Channel names can't contain spaces; use hyphens.
 ALLOWED_ANNOUNCE_CHANNELS = {"fec-announcements", "election-results", "fec-public-records"}
 
-# Optional: if you want a specific emoji name like :FEC:
-# The message format will still work even if the emoji doesn't exist, it’ll just display text.
-HEADER_PREFIX = ":FEC:"
+# ✅ Reliable header prefix (always renders)
+HEADER_PREFIX = "<:FEC:123456789012345678>"
+
+# If you want your custom Discord emoji, replace HEADER_PREFIX with the FULL emoji tag:
+# Example: HEADER_PREFIX = "<:FEC:123456789012345678>"
+# To get it: type \:FEC: in Discord and copy the result.
 
 
 # =========================
@@ -26,7 +30,7 @@ HEADER_PREFIX = ":FEC:"
 # =========================
 def make_case_reference() -> str:
     """
-    Example: FEC-26-0119-8130
+    Example: FEC-26-0122-8130
     YY-MMDD-RAND4
     """
     now = datetime.now(UTC)
@@ -72,9 +76,7 @@ def unauthorized_notice(case_ref: str) -> str:
 # DISCORD SETUP
 # =========================
 intents = discord.Intents.default()
-# Message content intent is NOT required for slash commands. Keep it off.
-# intents.message_content = True
-
+# Message content intent is NOT required for slash commands.
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
@@ -89,10 +91,9 @@ async def on_ready():
 
 
 # =========================
-# UI: CHANNEL PICKER (MANUAL OPTIONS)
+# UI: CHANNEL PICKER
 # =========================
 def get_bot_member(guild: discord.Guild) -> discord.Member | None:
-    """More reliable than interaction.guild.me in some setups."""
     if bot.user is None:
         return None
     return guild.get_member(bot.user.id)
@@ -105,11 +106,11 @@ def eligible_announce_channels(guild: discord.Guild) -> list[discord.TextChannel
 
     eligible: list[discord.TextChannel] = []
     for ch in guild.text_channels:
-        # Only allow specific channels by name (your allowlist)
         if ch.name not in ALLOWED_ANNOUNCE_CHANNELS:
             continue
 
         perms = ch.permissions_for(bot_member)
+        # If you later move to embeds, add perms.embed_links here too.
         if perms.view_channel and perms.send_messages:
             eligible.append(ch)
 
@@ -218,7 +219,7 @@ class AnnounceChannelPicker(discord.ui.View):
 # =========================
 @bot.tree.command(name="ping", description="Check if the FEC bot is online.")
 async def ping(interaction: discord.Interaction):
-    # Prevents "Interaction has already been acknowledged" (40060) from crashing the command.
+    # Prevents 40060 "already acknowledged" from crashing.
     if interaction.response.is_done():
         await interaction.followup.send("✅ Online.", ephemeral=True)
     else:
@@ -226,7 +227,15 @@ async def ping(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="announce", description="Post an FEC-formatted announcement to an approved channel.")
-async def announce(interaction: discord.Interaction, title: str, message: str):
+@app_commands.describe(
+    title="Announcement title",
+    message="Full announcement text (supports multiple paragraphs / line breaks)"
+)
+async def announce(
+    interaction: discord.Interaction,
+    title: str,
+    message: app_commands.Range[str, 1, 4000],  # ✅ makes Discord show a larger multiline input box
+):
     if interaction.guild is None:
         await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
         return
@@ -248,26 +257,27 @@ async def announce(interaction: discord.Interaction, title: str, message: str):
         )
         return
 
-    # Defer quickly so Discord never times out (helps with Render cold starts / lag)
+    # Defer quickly so Discord never times out (helps with Render lag/cold start)
     await interaction.response.defer(ephemeral=True)
 
-    # Build eligible channel list and guard
+    # Build eligible channel list
     channels = eligible_announce_channels(interaction.guild)
 
+    # Guard: if no channels match or bot lacks perms, explain it clearly
     if not channels:
         await interaction.followup.send(
             "❌ No approved announcement channels found that I can post in.\n\n"
             f"Approved channel names: {', '.join(sorted(ALLOWED_ANNOUNCE_CHANNELS))}\n"
-            "Fix: make sure those channels exist (exact names) and that I have **View Channel** + "
+            "Fix: ensure those channels exist (exact names) and that I have **View Channel** + "
             "**Send Messages** permissions in them.",
             ephemeral=True
         )
         return
 
-    # Send picker UI (as followup because we deferred)
+    # Show picker UI (as followup because we deferred)
     await interaction.followup.send(
         "Select the channel for this announcement:",
-        view=AnnounceChannelPicker(title, message, channels),
+        view=AnnounceChannelPicker(title, str(message), channels),
         ephemeral=True
     )
 
