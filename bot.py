@@ -133,6 +133,8 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 DB_POOL: Optional[asyncpg.Pool] = None
+DB_READY: bool = False
+STARTUP_ERROR: Optional[str] = None
 
 
 async def db() -> asyncpg.Pool:
@@ -185,25 +187,50 @@ async def ensure_schema(pool: asyncpg.Pool) -> None:
     )
 
 
-async def init_db_and_sync():
-    global DB_POOL
+async def init_db_and_sync() -> None:
+    """
+    IMPORTANT: This must never crash the process.
+    If Postgres is down/misconfigured, we keep the bot online and mark DB_READY=False.
+    """
+    global DB_POOL, DB_READY, STARTUP_ERROR
+
+    DB_READY = False
+    STARTUP_ERROR = None
 
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
-        raise RuntimeError("DATABASE_URL env var is missing (Render Postgres).")
+        STARTUP_ERROR = "DATABASE_URL env var is missing (Render Postgres)."
+        print(f"⚠️ Startup warning: {STARTUP_ERROR}")
+        return
 
-    DB_POOL = await asyncpg.create_pool(
-        dsn=normalize_db_url(database_url),
-        min_size=1,
-        max_size=5,
-    )
-    await ensure_schema(DB_POOL)
+    try:
+        DB_POOL = await asyncpg.create_pool(
+            dsn=normalize_db_url(database_url),
+            min_size=1,
+            max_size=5,
+        )
+        await ensure_schema(DB_POOL)
 
-    # Fast guild sync to avoid "command is outdated"
-    guild_obj = discord.Object(id=DEV_GUILD_ID)
-    bot.tree.copy_global_to(guild=guild_obj)
-    synced = await bot.tree.sync(guild=guild_obj)
-    print(f"✅ Synced {len(synced)} commands to DEV guild {DEV_GUILD_ID}.")
+        # Fast guild sync to avoid "command is outdated"
+        guild_obj = discord.Object(id=DEV_GUILD_ID)
+        bot.tree.copy_global_to(guild=guild_obj)
+
+        try:
+            synced = await bot.tree.sync(guild=guild_obj)
+            print(f"✅ Synced {len(synced)} commands to DEV guild {DEV_GUILD_ID}.")
+        except Exception as e:
+            # Sync failure shouldn't kill the bot either.
+            STARTUP_ERROR = f"Slash command sync failed: {type(e).__name__}: {e}"
+            print(f"⚠️ Startup warning: {STARTUP_ERROR}")
+
+        DB_READY = True
+        print("✅ DB_READY=True")
+
+    except Exception as e:
+        STARTUP_ERROR = f"DB init failed: {type(e).__name__}: {e}"
+        print(f"⚠️ Startup warning: {STARTUP_ERROR}")
+        traceback.print_exception(type(e), e, e.__traceback__)
+        DB_READY = False
 
 
 @bot.event
@@ -214,7 +241,29 @@ async def setup_hook():
 
 @bot.event
 async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
+    print(f"✅ Logged in as {bot.user} | DB_READY={DB_READY}")
+
+
+def db_not_ready_message() -> str:
+    extra = f"\n\n**Startup error:** {STARTUP_ERROR}" if STARTUP_ERROR else ""
+    return (
+        "⚠️ **Database not ready.**\n"
+        "This bot is online, but Postgres isn’t connected yet.\n\n"
+        "Fix in Render → **Environment**:\n"
+        "- `DATABASE_URL` (Render Postgres connection string)\n"
+        "- (Optional) confirm the Postgres instance is running\n"
+        f"{extra}"
+    )
+
+
+async def require_db_ready(interaction: discord.Interaction) -> bool:
+    if not DB_READY or DB_POOL is None:
+        if interaction.response.is_done():
+            await interaction.followup.send(db_not_ready_message(), ephemeral=True)
+        else:
+            await interaction.response.send_message(db_not_ready_message(), ephemeral=True)
+        return False
+    return True
 
 
 # =========================
@@ -313,6 +362,8 @@ async def office_results(pool: asyncpg.Pool, election_id: str, office: str) -> t
 
 
 async def post_auto_update(guild: discord.Guild, election_id: str) -> None:
+    if DB_POOL is None:
+        return
     pool = await db()
     election = await fetch_election(pool, election_id)
     if not election:
@@ -504,6 +555,8 @@ async def begin_election(
     member = await require_fec(interaction)
     if member is None:
         return
+    if not await require_db_ready(interaction):
+        return
 
     pool = await db()
     try:
@@ -544,6 +597,8 @@ async def add_candidate(
 ):
     member = await require_fec(interaction)
     if member is None:
+        return
+    if not await require_db_ready(interaction):
         return
 
     pool = await db()
@@ -590,6 +645,9 @@ async def election_open(interaction: discord.Interaction, election_id: str):
     member = await require_fec(interaction)
     if member is None:
         return
+    if not await require_db_ready(interaction):
+        return
+
     pool = await db()
     election = await fetch_election(pool, election_id)
     if not election:
@@ -604,6 +662,9 @@ async def election_close(interaction: discord.Interaction, election_id: str):
     member = await require_fec(interaction)
     if member is None:
         return
+    if not await require_db_ready(interaction):
+        return
+
     pool = await db()
     election = await fetch_election(pool, election_id)
     if not election:
@@ -713,6 +774,8 @@ class VoteView(discord.ui.View):
             voter = await require_voter(interaction)
             if voter is None:
                 return
+            if not await require_db_ready(interaction):
+                return
 
             pool = await db()
             election = await fetch_election(pool, self.parent.election_id)
@@ -778,6 +841,8 @@ class VoteView(discord.ui.View):
 async def vote(interaction: discord.Interaction, election_id: str):
     voter = await require_voter(interaction)
     if voter is None:
+        return
+    if not await require_db_ready(interaction):
         return
 
     pool = await db()
@@ -847,6 +912,8 @@ class RejectModal(discord.ui.Modal, title="Reject Ballot"):
         member = await require_fec(interaction)
         if member is None:
             return
+        if not await require_db_ready(interaction):
+            return
 
         pool = await db()
         await pool.execute(
@@ -875,6 +942,8 @@ class ReviewView(discord.ui.View):
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         member = await require_fec(interaction)
         if member is None:
+            return
+        if not await require_db_ready(interaction):
             return
 
         pool = await db()
@@ -907,6 +976,8 @@ class ReviewView(discord.ui.View):
 async def ballots_next(interaction: discord.Interaction, election_id: str):
     member = await require_fec(interaction)
     if member is None:
+        return
+    if not await require_db_ready(interaction):
         return
 
     pool = await db()
@@ -968,6 +1039,9 @@ async def ballots_next(interaction: discord.Interaction, election_id: str):
 @bot.tree.command(name="election_report", description="Show reporting % and leaders for an election.")
 @app_commands.describe(election_id="Election ID (e.g. January26)")
 async def election_report(interaction: discord.Interaction, election_id: str):
+    if not await require_db_ready(interaction):
+        return
+
     pool = await db()
     election = await fetch_election(pool, election_id)
     if not election:
@@ -1004,6 +1078,9 @@ async def election_report(interaction: discord.Interaction, election_id: str):
 @bot.tree.command(name="election_results", description="Show full results (vote counts + %).")
 @app_commands.describe(election_id="Election ID (e.g. January26)")
 async def election_results(interaction: discord.Interaction, election_id: str):
+    if not await require_db_ready(interaction):
+        return
+
     pool = await db()
     election = await fetch_election(pool, election_id)
     if not election:
@@ -1054,6 +1131,17 @@ async def ping(interaction: discord.Interaction):
         await interaction.followup.send("✅ Online.", ephemeral=True)
     else:
         await interaction.response.send_message("✅ Online.", ephemeral=True)
+
+
+# =========================
+# HEALTH / STATUS
+# =========================
+@bot.tree.command(name="status", description="Show bot health + DB connection status.")
+async def status(interaction: discord.Interaction):
+    msg = f"✅ Online.\n**DB_READY:** `{DB_READY}`"
+    if STARTUP_ERROR:
+        msg += f"\n**Startup error:** {STARTUP_ERROR}"
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
 # =========================
