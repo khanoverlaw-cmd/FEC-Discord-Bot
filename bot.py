@@ -1083,10 +1083,31 @@ async def ping(interaction: discord.Interaction):
 
 
 # =========================
-# RUN
+# RUN (safe retry / backoff)
 # =========================
+import time
+import discord
+
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN")
     if not token:
-        raise RuntimeError("DISCORD_TOKEN env var is missing.")
-    bot.run(token)
+        raise RuntimeError("DISCORD_TOKEN env var is missing. Add it in Render → Environment.")
+
+    backoff = 30          # start with 30s
+    max_backoff = 15 * 60 # cap at 15 min
+
+    while True:
+        try:
+            bot.run(token)
+            backoff = 30  # reset if it ever exits cleanly (rare)
+        except discord.HTTPException as e:
+            # When Discord/Cloudflare rate limits login, prevent restart spam
+            if getattr(e, "status", None) == 429:
+                print(f"⚠️ Discord login rate-limited (429). Sleeping {backoff}s then retrying...")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+                continue
+            raise
+        except Exception as e:
+            print(f"❌ Fatal error: {e}")
+            raise
