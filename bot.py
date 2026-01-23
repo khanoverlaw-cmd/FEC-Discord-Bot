@@ -1147,35 +1147,37 @@ async def status(interaction: discord.Interaction):
 import asyncio
 
 # =========================
-# RUN (handles Discord 429 without crash-looping Render)
+# RUN (avoid Render crash-loop on Discord global 429)
 # =========================
-async def main():
+import sys
+import time
+
+if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN")
     if not token:
         raise RuntimeError("DISCORD_TOKEN env var is missing. Add it in Render → Environment.")
 
+    backoff = 60          # start at 60s
+    max_backoff = 15 * 60 # cap at 15 minutes
+
     while True:
         try:
-            # start() is async; lets us catch 429 and WAIT instead of crashing
-            await bot.start(token)
+            bot.run(token)  # blocks until disconnect / fatal error
+            # If it ever exits cleanly (rare), reset backoff and restart.
+            backoff = 60
+
         except discord.HTTPException as e:
+            # Discord global rate limit on login
             if getattr(e, "status", None) == 429:
-                # Try to respect Discord's Retry-After header if present
-                retry_after = None
-                try:
-                    retry_after = float(getattr(e, "retry_after", None) or e.response.headers.get("Retry-After"))
-                except Exception:
-                    retry_after = None
+                print(f"⚠️ Global rate limit (429). Sleeping {backoff}s to avoid crash-loop...")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
 
-                wait_s = retry_after or 60.0
-                print(f"⚠️ Discord global rate limited (429). Sleeping {wait_s:.1f}s then retrying login...")
-                await asyncio.sleep(wait_s)
-                continue
+                # Fresh process so we don't hit "Session is closed"
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+
+            raise  # other HTTP errors should surface
+
+        except Exception as e:
+            print(f"❌ Fatal error: {e}")
             raise
-        finally:
-            # Ensure the client is closed before any retry
-            if not bot.is_closed():
-                await bot.close()
-
-if __name__ == "__main__":
-    asyncio.run(main())
