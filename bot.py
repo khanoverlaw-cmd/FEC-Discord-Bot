@@ -1144,11 +1144,38 @@ async def status(interaction: discord.Interaction):
     await interaction.response.send_message(msg, ephemeral=True)
 
 
+import asyncio
+
 # =========================
-# RUN
+# RUN (handles Discord 429 without crash-looping Render)
 # =========================
-if __name__ == "__main__":
+async def main():
     token = os.getenv("DISCORD_TOKEN")
     if not token:
         raise RuntimeError("DISCORD_TOKEN env var is missing. Add it in Render → Environment.")
-    bot.run(token)
+
+    while True:
+        try:
+            # start() is async; lets us catch 429 and WAIT instead of crashing
+            await bot.start(token)
+        except discord.HTTPException as e:
+            if getattr(e, "status", None) == 429:
+                # Try to respect Discord's Retry-After header if present
+                retry_after = None
+                try:
+                    retry_after = float(getattr(e, "retry_after", None) or e.response.headers.get("Retry-After"))
+                except Exception:
+                    retry_after = None
+
+                wait_s = retry_after or 60.0
+                print(f"⚠️ Discord global rate limited (429). Sleeping {wait_s:.1f}s then retrying login...")
+                await asyncio.sleep(wait_s)
+                continue
+            raise
+        finally:
+            # Ensure the client is closed before any retry
+            if not bot.is_closed():
+                await bot.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
