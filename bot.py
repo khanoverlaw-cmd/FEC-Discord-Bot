@@ -24,9 +24,11 @@ BALLOT_CHANNEL_ID = 1464147534887915593  # ballot-counting
 
 RESULTS_CHANNEL_NAME = "election-results"  # auto updates go here by channel name
 
+# Use real channel names (no spaces in Discord channel names)
 ALLOWED_ANNOUNCE_CHANNELS = {"fec-announcements", "election-results", "fec-public-records"}
 
 # Custom emoji tag for header (replace ID with your real emoji id)
+# Tip: in Discord type \:FEC: and copy the output like <:FEC:123...>
 HEADER_PREFIX = "<:FEC:123456789012345678>"
 
 HOUSE_MAX_PICKS = 3
@@ -53,8 +55,9 @@ def fmt_header(title: str) -> str:
 def normalize_message_text(text: str) -> str:
     """
     Bulletproof paragraph breaks:
-    - If Discord strips Shift+Enter newlines, user can type \\n or \\n\\n.
-    - We convert literal sequences into real newlines.
+    - If Discord strips Shift+Enter newlines in slash command boxes,
+      user can type literal \\n or \\n\\n.
+    - We convert those literal sequences into real newlines.
     """
     return text.replace("\\n", "\n")
 
@@ -182,13 +185,9 @@ async def ensure_schema(pool: asyncpg.Pool) -> None:
     )
 
 
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}")
-
-
 async def init_db_and_sync():
     global DB_POOL
+
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL env var is missing (Render Postgres).")
@@ -209,7 +208,13 @@ async def init_db_and_sync():
 
 @bot.event
 async def setup_hook():
+    # setup_hook runs once during startup (after login), before on_ready
     await init_db_and_sync()
+
+
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user}")
 
 
 # =========================
@@ -420,7 +425,10 @@ class AnnounceChannelPicker(discord.ui.View):
 
 
 @bot.tree.command(name="announce", description="Post an FEC-formatted announcement to an approved channel.")
-@app_commands.describe(title="Announcement title", message="Text. Use \\n for line breaks if Shift+Enter fails.")
+@app_commands.describe(
+    title="Announcement title",
+    message="Text. If Shift+Enter fails, type \\n for line breaks, \\n\\n for paragraph breaks."
+)
 async def announce(interaction: discord.Interaction, title: str, message: app_commands.Range[str, 1, 4000]):
     member = await require_fec(interaction)
     if member is None:
@@ -440,7 +448,7 @@ async def announce(interaction: discord.Interaction, title: str, message: app_co
 
 
 # =========================
-# ELECTION CHOICES (Dyno-like dropdowns)
+# ELECTION CHOICES (Dropdowns)
 # =========================
 ELECTION_TYPES = [
     app_commands.Choice(name="Special", value="SPECIAL"),
@@ -548,12 +556,10 @@ async def add_candidate(
     party_val = party.value
     state_val = state.value if state else None
 
-    # Enforce state for House/Senate
     if off in ("HOUSE", "SENATE") and not state_val:
         await interaction.response.send_message("❌ State is required for House/Senate candidates.", ephemeral=True)
         return
 
-    # Enforce district only for House; ignore for others
     if off == "HOUSE":
         if district is None or district < 1:
             await interaction.response.send_message("❌ District is required for House candidates.", ephemeral=True)
@@ -611,10 +617,6 @@ async def election_close(interaction: discord.Interaction, election_id: str):
 # VOTING UI (Dropdowns)
 # =========================
 class PagedMultiSelect(discord.ui.Select):
-    """
-    Supports >25 options via paging.
-    With your current 11/17 candidates, it will just be one page.
-    """
     def __init__(self, placeholder: str, max_picks: int, options: list[discord.SelectOption], on_change):
         self._all_options = options
         self.page = 0
@@ -700,34 +702,7 @@ class VoteView(discord.ui.View):
             )
             self.add_item(self.senate_select)
 
-        self.add_item(self.PageButton(self))
         self.add_item(self.SubmitButton(self))
-
-    class PageButton(discord.ui.Button):
-        def __init__(self, parent: "VoteView"):
-            super().__init__(label="Next Page", style=discord.ButtonStyle.secondary)
-            self.parent = parent
-
-        async def callback(self, interaction: discord.Interaction):
-            target = None
-            if self.parent.house_select and self.parent.house_select.total_pages() > 1:
-                target = self.parent.house_select
-            elif self.parent.senate_select and self.parent.senate_select.total_pages() > 1:
-                target = self.parent.senate_select
-
-            if not target:
-                await interaction.response.send_message("No additional pages.", ephemeral=True)
-                return
-
-            next_page = (target.page + 1) % target.total_pages()
-            target.set_page(next_page)
-
-            await interaction.response.edit_message(
-                content=f"🗳️ **Ballot for `{self.parent.election_id}`**\n"
-                        f"House: up to {HOUSE_MAX_PICKS} | Senate: up to {SENATE_MAX_PICKS}\n"
-                        f"(Page {next_page + 1}/{target.total_pages()})",
-                view=self.parent
-            )
 
     class SubmitButton(discord.ui.Button):
         def __init__(self, parent: "VoteView"):
@@ -979,7 +954,6 @@ async def ballots_next(interaction: discord.Interaction, election_id: str):
     )
     embed.add_field(name="Discord Username & ID", value=f"{row['voter_username']} (`{row['voter_id']}`)", inline=False)
     embed.add_field(name="Server Nickname", value=row["voter_nickname"] or "N/A", inline=False)
-
     if row["include_house"]:
         embed.add_field(name="Ballot: House (up to 3)", value=house_text, inline=False)
     if row["include_senate"]:
@@ -1083,31 +1057,10 @@ async def ping(interaction: discord.Interaction):
 
 
 # =========================
-# RUN (safe retry / backoff)
+# RUN
 # =========================
-import time
-import discord
-
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN")
     if not token:
         raise RuntimeError("DISCORD_TOKEN env var is missing. Add it in Render → Environment.")
-
-    backoff = 30          # start with 30s
-    max_backoff = 15 * 60 # cap at 15 min
-
-    while True:
-        try:
-            bot.run(token)
-            backoff = 30  # reset if it ever exits cleanly (rare)
-        except discord.HTTPException as e:
-            # When Discord/Cloudflare rate limits login, prevent restart spam
-            if getattr(e, "status", None) == 429:
-                print(f"⚠️ Discord login rate-limited (429). Sleeping {backoff}s then retrying...")
-                time.sleep(backoff)
-                backoff = min(backoff * 2, max_backoff)
-                continue
-            raise
-        except Exception as e:
-            print(f"❌ Fatal error: {e}")
-            raise
+    bot.run(token)
