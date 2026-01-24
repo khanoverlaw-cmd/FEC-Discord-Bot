@@ -1435,7 +1435,7 @@ async def ping(interaction: discord.Interaction):
 import time
 
 LOGIN_BACKOFF_START = 30
-LOGIN_BACKOFF_CAP = 20 * 60
+LOGIN_BACKOFF_CAP = 20 * 60  # 20 minutes
 
 if __name__ == "__main__":
     token = (os.getenv("DISCORD_TOKEN") or "").strip()
@@ -1446,14 +1446,15 @@ if __name__ == "__main__":
 
     while True:
         try:
-            print("🔐 Starting bot via bot.run() ...")
+            print("Starting bot... token length:", len(token))
             bot.run(token)
-            print("🛑 bot.run() returned (unexpected). Restarting soon...")
-            delay = LOGIN_BACKOFF_START
-            time.sleep(10)
+            # If bot.run returns normally, break (usually it doesn't unless closed)
+            break
 
         except discord.HTTPException as e:
             status = getattr(e, "status", None)
+
+            # 429 = Discord rate limit
             if status == 429:
                 sleep_for = delay + random.randint(0, 15)
                 print(f"⚠️ Rate limited (429). Sleeping {sleep_for}s then retrying.")
