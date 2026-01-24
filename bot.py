@@ -27,6 +27,7 @@ log = logging.getLogger("fecbot")
 # CONFIG
 # =========================
 DEV_GUILD_ID = 1419829129573957724
+PROD_GUILD_ID = int((os.getenv("PROD_GUILD_ID") or "0").strip() or 0)
 
 FEC_ROLE_ID = 1462754795684233343
 AMERICAN_CITIZEN_ROLE_ID = 1419829130043723911
@@ -307,10 +308,18 @@ class FECBot(commands.Bot):
 
         # Command sync (dev guild)
         try:
-            guild_obj = discord.Object(id=DEV_GUILD_ID)
-            self.tree.copy_global_to(guild=guild_obj)
-            synced = await self.tree.sync(guild=guild_obj)
-            log.info("✅ Synced %d commands to DEV guild %s.", len(synced), DEV_GUILD_ID)
+            GUILD_IDS_TO_SYNC = [
+                DEV_GUILD_ID,
+                PROD_GUILD_ID,  # ← add this env var
+            ]
+
+            for gid in GUILD_IDS_TO_SYNC:
+                if not gid:
+                    continue
+                guild_obj = discord.Object(id=gid)
+                self.tree.copy_global_to(guild=guild_obj)
+                synced = await self.tree.sync(guild=guild_obj)
+                log.info("Synced %d commands to guild %s", len(synced), gid)
         except Exception as e:
             log.error("❌ Command sync failed (continuing; bot will still run):")
             traceback.print_exception(type(e), e, e.__traceback__)
@@ -712,7 +721,6 @@ async def begin_election(
     except asyncio.TimeoutError:
         await interaction.response.send_message("❌ DB timed out creating election. Try again.", ephemeral=True)
 
-
 @bot.tree.command(name="add_candidate", description="(FEC) Add a candidate to an election.")
 @app_commands.choices(office=OFFICES, party=PARTIES)
 @app_commands.autocomplete(state=state_autocomplete)
@@ -1099,7 +1107,102 @@ class VoteView(discord.ui.View):
                 ephemeral=True
             )
             self.parent.stop()
+            
+@bot.tree.command(name="vote", description="Cast your ballot for an OPEN election.")
+@app_commands.describe(election_id="Election ID (e.g. January26)")
+async def vote(interaction: discord.Interaction, election_id: str):
+    voter = await require_voter(interaction)
+    if voter is None:
+        return
 
+    await safe_defer(interaction, ephemeral=True)
+
+    pool = await db()
+
+    try:
+        election = await fetch_election(pool, election_id)
+    except asyncio.TimeoutError:
+        await interaction.followup.send("❌ DB timed out. Try again in a moment.", ephemeral=True)
+        return
+
+    if not election:
+        await interaction.followup.send("❌ Election not found.", ephemeral=True)
+        return
+
+    if (election["status"] or "").upper() != "OPEN":
+        await interaction.followup.send("❌ Polls are not open for this election.", ephemeral=True)
+        return
+
+    # Pull candidates for enabled offices
+    try:
+        rows = await db_call(pool.fetch(
+            """
+            SELECT candidate_id, office, rp_name, party, state, district
+            FROM candidates
+            WHERE election_id=$1
+            ORDER BY office ASC, state NULLS LAST, district NULLS LAST, rp_name ASC
+            """,
+            election_id
+        ))
+    except asyncio.TimeoutError:
+        await interaction.followup.send("❌ DB timed out fetching candidates.", ephemeral=True)
+        return
+
+    house_opts: list[discord.SelectOption] = []
+    senate_opts: list[discord.SelectOption] = []
+    pres_opts: list[discord.SelectOption] = []
+
+    for r in rows:
+        office = (r["office"] or "").upper()
+        cid = int(r["candidate_id"])
+
+        label = candidate_label(office, r["rp_name"], r["party"], r["state"], r["district"])
+        # Discord limits: label <= 100 chars, description <= 100 chars
+        label = label[:100]
+
+        opt = discord.SelectOption(
+            label=label,
+            value=str(cid),
+            description=pretty_party(r["party"])[:100]
+        )
+
+        if office == "HOUSE":
+            house_opts.append(opt)
+        elif office == "SENATE":
+            senate_opts.append(opt)
+        elif office == "PRESIDENT":
+            pres_opts.append(opt)
+
+    # If an office is enabled but has no candidates, fail fast
+    if election["include_house"] and not house_opts:
+        await interaction.followup.send("❌ House is enabled, but no House candidates are registered.", ephemeral=True)
+        return
+    if election["include_senate"] and not senate_opts:
+        await interaction.followup.send("❌ Senate is enabled, but no Senate candidates are registered.", ephemeral=True)
+        return
+    if election["include_pres"] and not pres_opts:
+        await interaction.followup.send("❌ President is enabled, but no Presidential candidates are registered.", ephemeral=True)
+        return
+
+    view = VoteView(
+        election_id=election_id,
+        include_house=bool(election["include_house"]),
+        include_senate=bool(election["include_senate"]),
+        include_pres=bool(election["include_pres"]),
+        house_opts=house_opts,
+        senate_opts=senate_opts,
+        pres_opts=pres_opts,
+    )
+
+    msg_lines = [
+        f"**Election:** `{election_id}`",
+        f"**Status:** {election_status_badge(election['status'])}",
+        "",
+        "Use the dropdowns to select candidates, then press **Submit Ballot**.",
+        f"House max: **{HOUSE_MAX_PICKS}** • Senate max: **{SENATE_MAX_PICKS}**"
+    ]
+    await interaction.followup.send("\n".join(msg_lines), view=view, ephemeral=True)
+    
 # =========================
 # BALLOT REVIEW (FEC)
 # =========================
