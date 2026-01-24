@@ -35,8 +35,6 @@ MAX_SELECT_OPTIONS = 25
 DISCORD_MESSAGE_LIMIT = 2000
 
 AUTO_UPDATE_MIN_SECONDS = 30  # throttle for results edits
-LOGIN_BACKOFF_START = 60
-LOGIN_BACKOFF_CAP = 30 * 60
 
 STATE_CODES = {
     "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA",
@@ -238,25 +236,22 @@ async def db() -> asyncpg.Pool:
 # DISCORD BOT SETUP
 # =========================
 intents = discord.Intents.default()
-
 class FECBot(commands.Bot):
     async def setup_hook(self) -> None:
-        # DB init
         try:
             await ensure_db_pool()
             print("✅ DB pool initialized.")
         except Exception as e:
-            print("❌ DB init failed (bot will still start; DB commands may fail until fixed):")
+            print("❌ DB init failed (bot will still start):")
             traceback.print_exception(type(e), e, e.__traceback__)
 
-        # Sync to dev guild for fast iteration
         try:
             guild_obj = discord.Object(id=DEV_GUILD_ID)
             self.tree.copy_global_to(guild=guild_obj)
             synced = await self.tree.sync(guild=guild_obj)
             print(f"✅ Synced {len(synced)} commands to DEV guild {DEV_GUILD_ID}.")
         except Exception as e:
-            print("❌ Command sync failed:")
+            print("❌ Command sync failed (continuing; bot will still run):")
             traceback.print_exception(type(e), e, e.__traceback__)
 
     async def on_ready(self):
@@ -267,7 +262,7 @@ class FECBot(commands.Bot):
         print(f"✅ Logged in as {self.user}")
 
 
-bot = FECBot(command_prefix="!", intents=intents)
+bot = FECBot(command_prefix=None, intents=intents)
 
 
 # =========================
@@ -1396,31 +1391,48 @@ async def ping(interaction: discord.Interaction):
 # =========================
 # RUN (ANTI-RESTART-LOOP BACKOFF)
 # =========================
+LOGIN_BACKOFF_START = 30
+LOGIN_BACKOFF_CAP = 20 * 60
+
 async def start_with_backoff():
     token = (os.getenv("DISCORD_TOKEN") or "").strip()
     if not token:
-        raise RuntimeError("DISCORD_TOKEN env var is missing/empty. Add it in Render → Environment.")
+        raise RuntimeError("DISCORD_TOKEN env var is missing/empty.")
 
     delay = LOGIN_BACKOFF_START
+
     while True:
         try:
+            print("🔐 Attempting Discord login...")
             await bot.start(token, reconnect=True)
+            print("🛑 bot.start() returned unexpectedly; restarting soon.")
+            delay = LOGIN_BACKOFF_START
+            await asyncio.sleep(15)
+
         except discord.HTTPException as e:
             status = getattr(e, "status", None)
-            # Cloudflare 1015 shows up as 429 with HTML body during login
             if status == 429:
                 sleep_for = delay + random.randint(0, 15)
-                print(f"⚠️ Rate-limited on login (429/Cloudflare). Sleeping {sleep_for}s then retrying...")
+                print(f"⚠️ Login rate-limited (429). Sleeping {sleep_for}s then retrying.")
                 await asyncio.sleep(sleep_for)
                 delay = min(delay * 2, LOGIN_BACKOFF_CAP)
                 continue
 
-            print(f"❌ HTTPException during bot start (status={status}): {e}")
-            await asyncio.sleep(120)
+            print(f"❌ HTTPException during login (status={status}): {repr(e)}")
+            traceback.print_exc()
+            await asyncio.sleep(60)
 
         except Exception as e:
-            print(f"❌ Unexpected exception during bot start: {e}")
-            await asyncio.sleep(120)
+            print("🔥 Fatal exception during bot.start:", repr(e))
+            traceback.print_exc()
+            await asyncio.sleep(60)
+
+        finally:
+            # guarantees aiohttp sessions close
+            try:
+                await bot.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
