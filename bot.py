@@ -4,7 +4,7 @@ import random
 import traceback
 import asyncio
 from datetime import datetime, timezone
-from typing import Optional, Sequence
+from typing import Optional, Sequence, List, Dict, Tuple
 
 import discord
 from discord.ext import commands
@@ -23,7 +23,7 @@ AMERICAN_CITIZEN_ROLE_ID = 1419829130043723911
 LOG_CHANNEL_NAME = "interaction-logs"
 BALLOT_CHANNEL_ID = 1464147534887915593  # ballot-counting
 
-RESULTS_CHANNEL_NAME = "election-results"  # auto updates go here by channel name
+RESULTS_CHANNEL_NAME = "election-results"  # live updates go here (by name)
 ALLOWED_ANNOUNCE_CHANNELS = {"fec-announcements", "election-results", "fec-public-records"}
 
 HEADER_PREFIX = "<:FEC:123456789012345678>"
@@ -34,9 +34,17 @@ SENATE_MAX_PICKS = 2
 MAX_SELECT_OPTIONS = 25
 DISCORD_MESSAGE_LIMIT = 2000
 
-# Throttle auto-updates so you don't spam edits/messages
-AUTO_UPDATE_MIN_SECONDS = 30
+AUTO_UPDATE_MIN_SECONDS = 30  # throttle for results edits
+LOGIN_BACKOFF_START = 60
+LOGIN_BACKOFF_CAP = 30 * 60
 
+STATE_CODES = {
+    "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA",
+    "HI","ID","IL","IN","IA","KS","KY","LA","ME","MD",
+    "MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
+    "NM","NY","NC","ND","OH","OK","OR","PA","RI","SC",
+    "SD","TN","TX","UT","VT","VA","WA","WV","WI","WY"
+}
 
 # =========================
 # HELPERS
@@ -104,6 +112,20 @@ def candidate_label(office: str, name: str, party: str, state: Optional[str], di
     return f"{name} ({party})"
 
 
+def pretty_party(p: str) -> str:
+    p = (p or "").upper().strip()
+    return {"DEM":"Democratic","REP":"Republican","IND":"Independent","LIB":"Libertarian","GRN":"Green"}.get(p, p or "—")
+
+
+def office_badge(office: str) -> str:
+    return {"HOUSE":"🏛️ House", "SENATE":"🏛️ Senate", "PRESIDENT":"🇺🇸 President"}.get(office, office)
+
+
+def election_status_badge(status: str) -> str:
+    s = (status or "").upper()
+    return {"DRAFT":"📝 DRAFT", "OPEN":"🟢 OPEN", "CLOSED":"🔴 CLOSED", "CERTIFIED":"✅ CERTIFIED"}.get(s, s)
+
+
 async def safe_log_event(guild: discord.Guild, text: str) -> None:
     try:
         ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
@@ -128,10 +150,6 @@ def get_database_url() -> str:
 
 
 async def ensure_schema(pool: asyncpg.Pool) -> None:
-    """
-    Create schema + add columns safely.
-    Avoid multi-statement execute surprises by executing statements one-by-one.
-    """
     stmts = [
         """
         CREATE TABLE IF NOT EXISTS elections (
@@ -140,7 +158,7 @@ async def ensure_schema(pool: asyncpg.Pool) -> None:
             include_house BOOLEAN NOT NULL,
             include_senate BOOLEAN NOT NULL,
             include_pres BOOLEAN NOT NULL,
-            status TEXT NOT NULL DEFAULT 'DRAFT',  -- DRAFT / OPEN / CLOSED
+            status TEXT NOT NULL DEFAULT 'DRAFT',  -- DRAFT / OPEN / CLOSED / CERTIFIED
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         """,
@@ -174,10 +192,23 @@ async def ensure_schema(pool: asyncpg.Pool) -> None:
             UNIQUE (election_id, voter_id)
         );
         """,
-        # For stable live-updates: store one message id to edit instead of spamming new ones
+        # Live update message tracking + throttling
         "ALTER TABLE elections ADD COLUMN IF NOT EXISTS results_message_id BIGINT;",
-        # For throttling (optional, but useful)
         "ALTER TABLE elections ADD COLUMN IF NOT EXISTS last_results_update_at TIMESTAMPTZ;",
+        # Certification snapshot
+        """
+        CREATE TABLE IF NOT EXISTS election_certifications (
+            election_id TEXT PRIMARY KEY REFERENCES elections(election_id) ON DELETE CASCADE,
+            certified_by BIGINT NOT NULL,
+            certified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            submitted_ballots INT NOT NULL,
+            accepted_ballots INT NOT NULL,
+            house_snapshot JSONB,
+            senate_snapshot JSONB,
+            pres_snapshot JSONB,
+            notes TEXT
+        );
+        """,
     ]
 
     async with pool.acquire() as conn:
@@ -207,7 +238,6 @@ async def db() -> asyncpg.Pool:
 # DISCORD BOT SETUP
 # =========================
 intents = discord.Intents.default()
-# Slash commands do not require message_content intent.
 
 class FECBot(commands.Bot):
     async def setup_hook(self) -> None:
@@ -230,7 +260,7 @@ class FECBot(commands.Bot):
             traceback.print_exception(type(e), e, e.__traceback__)
 
     async def on_ready(self):
-        # on_ready can fire multiple times on reconnect.
+        # Can fire multiple times on reconnect
         if getattr(self, "_ready_once", False):
             return
         self._ready_once = True
@@ -241,37 +271,40 @@ bot = FECBot(command_prefix="!", intents=intents)
 
 
 # =========================
-# PERMISSION HELPERS
+# PERMISSIONS
 # =========================
-async def require_fec(interaction: discord.Interaction) -> Optional[discord.Member]:
+async def require_guild(interaction: discord.Interaction) -> Optional[discord.Guild]:
     if interaction.guild is None:
         if not interaction.response.is_done():
             await interaction.response.send_message("❌ Server-only.", ephemeral=True)
         return None
+    return interaction.guild
 
+
+async def require_fec(interaction: discord.Interaction) -> Optional[discord.Member]:
+    g = await require_guild(interaction)
+    if g is None:
+        return None
     member = interaction.user
     if not isinstance(member, discord.Member):
-        member = interaction.guild.get_member(interaction.user.id)
-
+        member = g.get_member(interaction.user.id)
     if member is None or not has_role_id(member, FEC_ROLE_ID):
+        msg = "❌ FEC only."
         if not interaction.response.is_done():
-            await interaction.response.send_message("❌ FEC only.", ephemeral=True)
+            await interaction.response.send_message(msg, ephemeral=True)
         else:
-            await interaction.followup.send("❌ FEC only.", ephemeral=True)
+            await interaction.followup.send(msg, ephemeral=True)
         return None
     return member
 
 
 async def require_voter(interaction: discord.Interaction) -> Optional[discord.Member]:
-    if interaction.guild is None:
-        if not interaction.response.is_done():
-            await interaction.response.send_message("❌ Server-only.", ephemeral=True)
+    g = await require_guild(interaction)
+    if g is None:
         return None
-
     member = interaction.user
     if not isinstance(member, discord.Member):
-        member = interaction.guild.get_member(interaction.user.id)
-
+        member = g.get_member(interaction.user.id)
     if member is None or not has_role_id(member, AMERICAN_CITIZEN_ROLE_ID):
         msg = "❌ You are not eligible to vote (American Citizen role required)."
         if not interaction.response.is_done():
@@ -286,13 +319,18 @@ async def fetch_election(pool: asyncpg.Pool, election_id: str):
     return await pool.fetchrow("SELECT * FROM elections WHERE election_id=$1", election_id)
 
 
+async def election_is_certified(pool: asyncpg.Pool, election_id: str) -> bool:
+    status = await pool.fetchval("SELECT status FROM elections WHERE election_id=$1", election_id)
+    return (status or "").upper() == "CERTIFIED"
+
+
 async def get_results_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
     ch = discord.utils.get(guild.text_channels, name=RESULTS_CHANNEL_NAME)
     return ch if isinstance(ch, discord.TextChannel) else None
 
 
 # =========================
-# TABULATION / RESULTS
+# RESULTS / TABULATION
 # =========================
 async def reporting_stats(pool: asyncpg.Pool, election_id: str) -> tuple[int, int, float]:
     submitted = await pool.fetchval("SELECT COUNT(*) FROM ballots WHERE election_id=$1", election_id) or 0
@@ -301,7 +339,7 @@ async def reporting_stats(pool: asyncpg.Pool, election_id: str) -> tuple[int, in
         election_id
     ) or 0
     pct = (accepted / submitted * 100.0) if submitted else 0.0
-    return submitted, accepted, pct
+    return int(submitted), int(accepted), float(pct)
 
 
 async def office_results(pool: asyncpg.Pool, election_id: str, office: str) -> tuple[list[tuple[str, int, float]], int]:
@@ -337,41 +375,46 @@ async def office_results(pool: asyncpg.Pool, election_id: str, office: str) -> t
     for r in recs:
         label = candidate_label(office, r["rp_name"], r["party"], r["state"], r["district"])
         pct = (r["votes"] / total * 100.0) if total else 0.0
-        out.append((label, r["votes"], pct))
-    return out, total
+        out.append((label, int(r["votes"]), float(pct)))
+    return out, int(total)
 
 
-async def build_auto_update_text(pool: asyncpg.Pool, election) -> str:
+async def build_results_embed(pool: asyncpg.Pool, election) -> discord.Embed:
     election_id = election["election_id"]
     submitted, accepted, pct = await reporting_stats(pool, election_id)
 
-    lines: list[str] = []
-    lines.append(f"🗳️ **Election Night Update — `{election_id}`**")
-    lines.append(f"Reporting: {bar(pct)} **{pct:.1f}%**  (Accepted {accepted} / Submitted {submitted})")
+    em = discord.Embed(
+        title=f"🗳️ Election Night Update — {election_id}",
+        description=f"**Status:** {election_status_badge(election['status'])}\n"
+                    f"**Reporting:** {bar(pct)} **{pct:.1f}%**\n"
+                    f"Accepted **{accepted}** / Submitted **{submitted}**",
+        timestamp=now_utc()
+    )
+    em.set_footer(text="Federal Elections Commission • Live Reporting")
 
     if election["include_house"]:
         res, _ = await office_results(pool, election_id, "HOUSE")
         if res:
-            lines.append("")
-            lines.append("**House (Top 3)**")
-            for label, votes, p in res[:3]:
-                lines.append(f"- {label}: **{votes}** ({p:.1f}%)")
+            top = "\n".join([f"• {label} — **{votes}** ({p:.1f}%)" for label, votes, p in res[:3]])
+        else:
+            top = "— No accepted votes yet."
+        em.add_field(name="🏛️ House (Top 3)", value=top, inline=False)
 
     if election["include_senate"]:
         res, _ = await office_results(pool, election_id, "SENATE")
         if res:
-            lines.append("")
-            lines.append("**Senate (Top 3)**")
-            for label, votes, p in res[:3]:
-                lines.append(f"- {label}: **{votes}** ({p:.1f}%)")
+            top = "\n".join([f"• {label} — **{votes}** ({p:.1f}%)" for label, votes, p in res[:3]])
+        else:
+            top = "— No accepted votes yet."
+        em.add_field(name="🏛️ Senate (Top 3)", value=top, inline=False)
 
-    return "\n".join(lines)
+    return em
 
 
 async def post_or_edit_auto_update(guild: discord.Guild, election_id: str) -> None:
     """
-    Edits a single message instead of sending a new one each time.
-    Also throttles updates to prevent Discord rate limits.
+    One message per election, edited in-place + throttled.
+    If election is CERTIFIED, we still allow updates if called, but typically you'd stop calling it.
     """
     pool = await db()
     election = await fetch_election(pool, election_id)
@@ -389,23 +432,22 @@ async def post_or_edit_auto_update(guild: discord.Guild, election_id: str) -> No
         if elapsed < AUTO_UPDATE_MIN_SECONDS:
             return
 
-    content = await build_auto_update_text(pool, election)
-
+    embed = await build_results_embed(pool, election)
     msg_id = election.get("results_message_id")
 
     try:
         if msg_id:
             try:
                 msg = await ch.fetch_message(int(msg_id))
-                await msg.edit(content=content)
+                await msg.edit(embed=embed, content=None)
             except (discord.NotFound, discord.Forbidden):
-                sent = await ch.send(content)
+                sent = await ch.send(embed=embed)
                 await pool.execute(
                     "UPDATE elections SET results_message_id=$2 WHERE election_id=$1",
                     election_id, sent.id
                 )
         else:
-            sent = await ch.send(content)
+            sent = await ch.send(embed=embed)
             await pool.execute(
                 "UPDATE elections SET results_message_id=$2 WHERE election_id=$1",
                 election_id, sent.id
@@ -417,12 +459,11 @@ async def post_or_edit_auto_update(guild: discord.Guild, election_id: str) -> No
         )
 
     except discord.HTTPException as e:
-        # Do NOT crash on rate limits
         print(f"⚠️ Auto-update failed: {e}")
 
 
 # =========================
-# ANNOUNCEMENTS UI
+# ANNOUNCEMENTS
 # =========================
 def get_bot_member(guild: discord.Guild) -> Optional[discord.Member]:
     if bot.user is None:
@@ -450,12 +491,7 @@ class AnnounceChannelSelect(discord.ui.Select):
             discord.SelectOption(label=f"#{ch.name}", value=str(ch.id), description="Approved FEC channel")
             for ch in channels[:25]
         ]
-        super().__init__(
-            placeholder="Select the channel for this announcement:",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
+        super().__init__(placeholder="Select an approved channel:", min_values=1, max_values=1, options=options)
         self.title = title
         self.message = message
 
@@ -472,8 +508,7 @@ class AnnounceChannelSelect(discord.ui.Select):
                 return
 
             if chosen_channel.name not in ALLOWED_ANNOUNCE_CHANNELS:
-                case_ref = make_case_reference()
-                await interaction.response.send_message(f"❌ Channel not authorized. Case `{case_ref}`", ephemeral=True)
+                await interaction.response.send_message(f"❌ Channel not authorized. Case `{make_case_reference()}`", ephemeral=True)
                 return
 
             body = normalize_message_text(self.message)
@@ -499,21 +534,16 @@ class AnnounceChannelPicker(discord.ui.View):
 
 
 @bot.tree.command(name="announce", description="Post an FEC-formatted announcement to an approved channel.")
-@app_commands.describe(
-    title="Announcement title",
-    message="Text. Use \\n for line breaks if Shift+Enter fails."
-)
+@app_commands.describe(title="Announcement title", message="Text. Use \\n for line breaks if Shift+Enter fails.")
 async def announce(interaction: discord.Interaction, title: str, message: app_commands.Range[str, 1, 4000]):
     member = await require_fec(interaction)
     if member is None:
         return
-
     await interaction.response.defer(ephemeral=True)
     channels = eligible_announce_channels(interaction.guild)
     if not channels:
         await interaction.followup.send("❌ No approved announce channels available for me.", ephemeral=True)
         return
-
     await interaction.followup.send(
         "Select the channel for this announcement:",
         view=AnnounceChannelPicker(title, str(message), channels),
@@ -522,7 +552,7 @@ async def announce(interaction: discord.Interaction, title: str, message: app_co
 
 
 # =========================
-# ELECTION CHOICES
+# CHOICES (<=25 only)
 # =========================
 ELECTION_TYPES = [
     app_commands.Choice(name="Special", value="SPECIAL"),
@@ -544,13 +574,15 @@ PARTIES = [
     app_commands.Choice(name="GRN", value="GRN"),
 ]
 
-STATES = [app_commands.Choice(name=s, value=s) for s in [
-    "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA",
-    "HI","ID","IL","IN","IA","KS","KY","LA","ME","MD",
-    "MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
-    "NM","NY","NC","ND","OH","OK","OR","PA","RI","SC",
-    "SD","TN","TX","UT","VT","VA","WA","WV","WI","WY"
-]]
+
+# =========================
+# STATE AUTOCOMPLETE
+# =========================
+async def state_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    cur = (current or "").strip().upper()
+    matches = [s for s in sorted(STATE_CODES) if s.startswith(cur)] if cur else sorted(STATE_CODES)
+    matches = matches[:25]
+    return [app_commands.Choice(name=s, value=s) for s in matches]
 
 
 # =========================
@@ -586,23 +618,28 @@ async def begin_election(
             """,
             election_id, election_type.value, include_house, include_senate, include_pres
         )
-        await interaction.response.send_message(
-            f"✅ Election `{election_id}` created as **{election_type.name}** (status: DRAFT).\n"
-            "Next: add candidates with `/add_candidate`, then `/election_open`.",
-            ephemeral=True
+        em = discord.Embed(
+            title="✅ Election Created",
+            description=f"**Election ID:** `{election_id}`\n"
+                        f"**Type:** `{election_type.value}`\n"
+                        f"**Status:** {election_status_badge('DRAFT')}\n\n"
+                        f"Next: `/add_candidate` then `/election_open`.",
+            timestamp=now_utc()
         )
+        await interaction.response.send_message(embed=em, ephemeral=True)
     except asyncpg.UniqueViolationError:
         await interaction.response.send_message(f"❌ Election `{election_id}` already exists.", ephemeral=True)
 
 
 @bot.tree.command(name="add_candidate", description="(FEC) Add a candidate to an election.")
-@app_commands.choices(office=OFFICES, party=PARTIES, state=STATES)
+@app_commands.choices(office=OFFICES, party=PARTIES)
+@app_commands.autocomplete(state=state_autocomplete)
 @app_commands.describe(
     election_id="Election ID (e.g. January26)",
     office="House / Senate / President",
     rp_name="Candidate RP name",
     party="Party",
-    state="State (required for House/Senate)",
+    state="Two-letter state code (e.g. TX). Required for House/Senate.",
     district="House district (required ONLY for House)"
 )
 async def add_candidate(
@@ -611,7 +648,7 @@ async def add_candidate(
     office: app_commands.Choice[str],
     rp_name: str,
     party: app_commands.Choice[str],
-    state: Optional[app_commands.Choice[str]] = None,
+    state: Optional[str] = None,
     district: Optional[int] = None
 ):
     member = await require_fec(interaction)
@@ -624,13 +661,21 @@ async def add_candidate(
         await interaction.response.send_message(f"❌ Election `{election_id}` not found.", ephemeral=True)
         return
 
+    if (election["status"] or "").upper() == "CERTIFIED":
+        await interaction.response.send_message("❌ Election is CERTIFIED; candidates cannot be modified.", ephemeral=True)
+        return
+
     off = office.value
     party_val = party.value
-    state_val = state.value if state else None
+    state_val = state.strip().upper() if state else None
 
-    if off in ("HOUSE", "SENATE") and not state_val:
-        await interaction.response.send_message("❌ State is required for House/Senate candidates.", ephemeral=True)
-        return
+    if off in ("HOUSE", "SENATE"):
+        if not state_val:
+            await interaction.response.send_message("❌ State is required for House/Senate candidates.", ephemeral=True)
+            return
+        if state_val not in STATE_CODES:
+            await interaction.response.send_message("❌ Invalid state. Use a 2-letter code like TX, CA, LA.", ephemeral=True)
+            return
 
     if off == "HOUSE":
         if district is None or district < 1:
@@ -648,11 +693,15 @@ async def add_candidate(
             """,
             election_id, off, rp_name, party_val, state_val, district
         )
-        await interaction.response.send_message(
-            f"✅ Added **{candidate_label(off, rp_name, party_val, state_val, district)}** "
-            f"(ID `{row['candidate_id']}`) to `{election_id}`.",
-            ephemeral=True
+        em = discord.Embed(
+            title="✅ Candidate Registered",
+            description=f"**Election:** `{election_id}`\n"
+                        f"**Office:** {office_badge(off)}\n"
+                        f"**Candidate:** {candidate_label(off, rp_name, party_val, state_val, district)}\n"
+                        f"**Candidate ID:** `{row['candidate_id']}`",
+            timestamp=now_utc()
         )
+        await interaction.response.send_message(embed=em, ephemeral=True)
     except asyncpg.UniqueViolationError:
         await interaction.response.send_message("❌ That candidate already exists for this election/office.", ephemeral=True)
 
@@ -666,6 +715,9 @@ async def election_open(interaction: discord.Interaction, election_id: str):
     election = await fetch_election(pool, election_id)
     if not election:
         await interaction.response.send_message(f"❌ Election `{election_id}` not found.", ephemeral=True)
+        return
+    if (election["status"] or "").upper() == "CERTIFIED":
+        await interaction.response.send_message("❌ Election is CERTIFIED; cannot reopen.", ephemeral=True)
         return
     if election["status"] == "OPEN":
         await interaction.response.send_message(f"✅ `{election_id}` is already OPEN.", ephemeral=True)
@@ -686,6 +738,9 @@ async def election_close(interaction: discord.Interaction, election_id: str):
     if not election:
         await interaction.response.send_message(f"❌ Election `{election_id}` not found.", ephemeral=True)
         return
+    if (election["status"] or "").upper() == "CERTIFIED":
+        await interaction.response.send_message("❌ Election is CERTIFIED; cannot change status.", ephemeral=True)
+        return
     if election["status"] == "CLOSED":
         await interaction.response.send_message(f"✅ `{election_id}` is already CLOSED.", ephemeral=True)
         return
@@ -696,7 +751,7 @@ async def election_close(interaction: discord.Interaction, election_id: str):
 
 
 # =========================
-# VOTING UI (Dropdowns + Paging)
+# VOTING UI (dropdowns + paging)
 # =========================
 class PagedMultiSelect(discord.ui.Select):
     def __init__(self, placeholder: str, max_picks: int, options: list[discord.SelectOption], on_change):
@@ -730,8 +785,7 @@ class PagedMultiSelect(discord.ui.Select):
         return ((len(self._all_options) - 1) // MAX_SELECT_OPTIONS) + 1
 
     async def callback(self, interaction: discord.Interaction):
-        # Do not spam ephemeral messages on every change
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=True)  # no spam messages
         await self.on_change(interaction, [int(v) for v in self.values])
 
 
@@ -741,16 +795,20 @@ class VoteView(discord.ui.View):
         election_id: str,
         include_house: bool,
         include_senate: bool,
+        include_pres: bool,
         house_opts: list[discord.SelectOption],
         senate_opts: list[discord.SelectOption],
+        pres_opts: list[discord.SelectOption],
     ):
         super().__init__(timeout=300)
         self.election_id = election_id
         self.house_selected: list[int] = []
         self.senate_selected: list[int] = []
+        self.pres_selected: Optional[int] = None
 
         self.house_select: Optional[PagedMultiSelect] = None
         self.senate_select: Optional[PagedMultiSelect] = None
+        self.pres_select: Optional[discord.ui.Select] = None
 
         if include_house:
             async def on_house_change(_interaction, values):
@@ -784,10 +842,28 @@ class VoteView(discord.ui.View):
             )
             self.add_item(self.senate_select)
 
-        # Paging buttons (work for whichever select exists)
+        if include_pres:
+            # President is single-pick; we can use normal Select (still max 25; if >25 we'd need paging)
+            options = pres_opts[:25]
+            self.pres_select = discord.ui.Select(
+                placeholder="President (pick 1)",
+                min_values=0,
+                max_values=1,
+                options=options
+            )
+
+            async def pres_callback(interaction: discord.Interaction):
+                await interaction.response.defer(ephemeral=True)
+                if self.pres_select and self.pres_select.values:
+                    self.pres_selected = int(self.pres_select.values[0])
+                else:
+                    self.pres_selected = None
+
+            self.pres_select.callback = pres_callback  # type: ignore
+            self.add_item(self.pres_select)
+
         self.add_item(self.PrevPageButton(self))
         self.add_item(self.NextPageButton(self))
-
         self.add_item(self.SubmitButton(self))
 
     def _active_select(self) -> Optional[PagedMultiSelect]:
@@ -829,7 +905,6 @@ class VoteView(discord.ui.View):
             voter = await require_voter(interaction)
             if voter is None:
                 return
-
             await interaction.response.defer(ephemeral=True)
 
             pool = await db()
@@ -837,12 +912,14 @@ class VoteView(discord.ui.View):
             if not election:
                 await interaction.followup.send("❌ Election not found.", ephemeral=True)
                 return
-            if election["status"] != "OPEN":
+            if (election["status"] or "").upper() != "OPEN":
                 await interaction.followup.send("❌ Polls are not open for this election.", ephemeral=True)
                 return
 
+            # At least one selection across enabled offices
             if election["include_house"] and not self.parent.house_selected and \
-               election["include_senate"] and not self.parent.senate_selected:
+               election["include_senate"] and not self.parent.senate_selected and \
+               election["include_pres"] and not self.parent.pres_selected:
                 await interaction.followup.send("❌ Your ballot is empty. Select at least one candidate.", ephemeral=True)
                 return
 
@@ -853,8 +930,8 @@ class VoteView(discord.ui.View):
                 row = await pool.fetchrow(
                     """
                     INSERT INTO ballots (election_id, voter_id, voter_username, voter_nickname,
-                                        house_choices, senate_choices, status)
-                    VALUES ($1,$2,$3,$4,$5,$6,'PENDING')
+                                        house_choices, senate_choices, pres_choice, status)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,'PENDING')
                     RETURNING ballot_id
                     """,
                     self.parent.election_id,
@@ -863,6 +940,7 @@ class VoteView(discord.ui.View):
                     voter_nick,
                     self.parent.house_selected,
                     self.parent.senate_selected,
+                    self.parent.pres_selected,
                 )
             except asyncpg.UniqueViolationError:
                 await interaction.followup.send("❌ You already submitted a ballot for this election.", ephemeral=True)
@@ -884,7 +962,7 @@ class VoteView(discord.ui.View):
                     await ch.send(embed=embed)
 
             await interaction.followup.send(
-                f"✅ Thanks, {interaction.user.mention}. Your ballot is received and pending review.",
+                f"✅ Thank you, {interaction.user.mention}. Your ballot is received and pending review.",
                 ephemeral=True
             )
             self.parent.stop()
@@ -902,7 +980,7 @@ async def vote(interaction: discord.Interaction, election_id: str):
     if not election:
         await interaction.response.send_message(f"❌ Election `{election_id}` not found.", ephemeral=True)
         return
-    if election["status"] != "OPEN":
+    if (election["status"] or "").upper() != "OPEN":
         await interaction.response.send_message(f"❌ Polls are not open for `{election_id}`.", ephemeral=True)
         return
 
@@ -913,6 +991,7 @@ async def vote(interaction: discord.Interaction, election_id: str):
 
     house_opts: list[discord.SelectOption] = []
     senate_opts: list[discord.SelectOption] = []
+    pres_opts: list[discord.SelectOption] = []
 
     for r in rows:
         label = candidate_label(r["office"], r["rp_name"], r["party"], r["state"], r["district"])
@@ -921,6 +1000,8 @@ async def vote(interaction: discord.Interaction, election_id: str):
             house_opts.append(opt)
         elif r["office"] == "SENATE":
             senate_opts.append(opt)
+        elif r["office"] == "PRESIDENT":
+            pres_opts.append(opt)
 
     if election["include_house"] and not house_opts:
         await interaction.response.send_message("❌ Election includes House but has no House candidates.", ephemeral=True)
@@ -928,17 +1009,32 @@ async def vote(interaction: discord.Interaction, election_id: str):
     if election["include_senate"] and not senate_opts:
         await interaction.response.send_message("❌ Election includes Senate but has no Senate candidates.", ephemeral=True)
         return
+    if election["include_pres"] and not pres_opts:
+        await interaction.response.send_message("❌ Election includes President but has no Presidential candidates.", ephemeral=True)
+        return
+    if election["include_pres"] and len(pres_opts) > 25:
+        await interaction.response.send_message("❌ Too many Presidential candidates (>25). Add paging for president or reduce candidates.", ephemeral=True)
+        return
+
+    description = (
+        f"**Election:** `{election_id}`\n"
+        f"**House:** up to {HOUSE_MAX_PICKS} • **Senate:** up to {SENATE_MAX_PICKS} • **President:** 1\n"
+        "Use Prev/Next if there are many candidates. Submit when ready."
+    )
+
+    em = discord.Embed(title="🗳️ Official Ballot", description=description, timestamp=now_utc())
+    em.set_footer(text="Federal Elections Commission • Ballot Submission")
 
     await interaction.response.send_message(
-        f"🗳️ **Ballot for `{election_id}`**\n"
-        f"House: up to {HOUSE_MAX_PICKS} | Senate: up to {SENATE_MAX_PICKS}\n"
-        "Use Prev/Next if there are many candidates. Submit when ready.",
+        embed=em,
         view=VoteView(
             election_id=election_id,
             include_house=election["include_house"],
             include_senate=election["include_senate"],
+            include_pres=election["include_pres"],
             house_opts=house_opts,
             senate_opts=senate_opts,
+            pres_opts=pres_opts,
         ),
         ephemeral=True
     )
@@ -1035,7 +1131,7 @@ async def ballots_next(interaction: discord.Interaction, election_id: str):
     pool = await db()
     row = await pool.fetchrow(
         """
-        SELECT b.*, e.include_house, e.include_senate
+        SELECT b.*, e.include_house, e.include_senate, e.include_pres
         FROM ballots b
         JOIN elections e ON e.election_id=b.election_id
         WHERE b.election_id=$1 AND b.status='PENDING'
@@ -1067,8 +1163,20 @@ async def ballots_next(interaction: discord.Interaction, election_id: str):
                 lines.append(f"Unknown Candidate ID {cid}")
         return "\n".join(lines)
 
+    async def name_for_one(cid: Optional[int]) -> str:
+        if not cid:
+            return "—"
+        r = await pool.fetchrow(
+            "SELECT office, rp_name, party, state, district FROM candidates WHERE candidate_id=$1",
+            cid
+        )
+        if not r:
+            return f"Unknown Candidate ID {cid}"
+        return candidate_label(r["office"], r["rp_name"], r["party"], r["state"], r["district"])
+
     house_text = await names_for(row["house_choices"])
     senate_text = await names_for(row["senate_choices"])
+    pres_text = await name_for_one(row["pres_choice"])
 
     embed = discord.Embed(
         title="🧾 Ballot Review",
@@ -1082,8 +1190,126 @@ async def ballots_next(interaction: discord.Interaction, election_id: str):
         embed.add_field(name="Ballot: House (up to 3)", value=house_text, inline=False)
     if row["include_senate"]:
         embed.add_field(name="Ballot: Senate (up to 2)", value=senate_text, inline=False)
+    if row["include_pres"]:
+        embed.add_field(name="Ballot: President (1)", value=pres_text, inline=False)
 
     await interaction.response.send_message(embed=embed, view=ReviewView(ballot_id, election_id), ephemeral=True)
+
+
+# =========================
+# CERTIFICATION WORKFLOW
+# =========================
+async def snapshot_office(pool: asyncpg.Pool, election_id: str, office: str) -> Dict:
+    res, total = await office_results(pool, election_id, office)
+    return {
+        "office": office,
+        "total_votes": total,
+        "results": [{"label": l, "votes": v, "pct": round(p, 2)} for (l, v, p) in res]
+    }
+
+
+@bot.tree.command(name="election_certify", description="(FEC) Certify an election (locks results + stores snapshot).")
+@app_commands.describe(election_id="Election ID", notes="Optional certification notes")
+async def election_certify(interaction: discord.Interaction, election_id: str, notes: Optional[str] = None):
+    member = await require_fec(interaction)
+    if member is None:
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    pool = await db()
+    election = await fetch_election(pool, election_id)
+    if not election:
+        await interaction.followup.send(f"❌ Election `{election_id}` not found.", ephemeral=True)
+        return
+
+    status = (election["status"] or "").upper()
+    if status != "CLOSED":
+        await interaction.followup.send("❌ You can only certify an election after polls are CLOSED.", ephemeral=True)
+        return
+
+    submitted, accepted, pct = await reporting_stats(pool, election_id)
+
+    # Build snapshots
+    house_snap = await snapshot_office(pool, election_id, "HOUSE") if election["include_house"] else None
+    senate_snap = await snapshot_office(pool, election_id, "SENATE") if election["include_senate"] else None
+    pres_snap = await snapshot_office(pool, election_id, "PRESIDENT") if election["include_pres"] else None
+
+    # Insert certification snapshot (upsert)
+    await pool.execute(
+        """
+        INSERT INTO election_certifications
+            (election_id, certified_by, submitted_ballots, accepted_ballots, house_snapshot, senate_snapshot, pres_snapshot, notes)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        ON CONFLICT (election_id)
+        DO UPDATE SET
+            certified_by=EXCLUDED.certified_by,
+            certified_at=NOW(),
+            submitted_ballots=EXCLUDED.submitted_ballots,
+            accepted_ballots=EXCLUDED.accepted_ballots,
+            house_snapshot=EXCLUDED.house_snapshot,
+            senate_snapshot=EXCLUDED.senate_snapshot,
+            pres_snapshot=EXCLUDED.pres_snapshot,
+            notes=EXCLUDED.notes
+        """,
+        election_id,
+        interaction.user.id,
+        submitted,
+        accepted,
+        house_snap,
+        senate_snap,
+        pres_snap,
+        notes
+    )
+
+    # Lock election
+    await pool.execute("UPDATE elections SET status='CERTIFIED' WHERE election_id=$1", election_id)
+
+    # Post final update
+    if interaction.guild:
+        await post_or_edit_auto_update(interaction.guild, election_id)
+
+    em = discord.Embed(
+        title="✅ Election Certified",
+        description=f"**Election:** `{election_id}`\n"
+                    f"**Certified by:** <@{interaction.user.id}>\n"
+                    f"**Ballots:** Accepted **{accepted}** / Submitted **{submitted}**\n"
+                    f"**Reporting:** {pct:.1f}%\n\n"
+                    f"Status is now **CERTIFIED**. Candidates & ballots are locked.",
+        timestamp=now_utc()
+    )
+    if notes:
+        em.add_field(name="Notes", value=notes[:1024], inline=False)
+    await interaction.followup.send(embed=em, ephemeral=True)
+
+
+@bot.tree.command(name="election_uncertify", description="(FEC) Revert CERTIFIED back to CLOSED (admin-only).")
+@app_commands.describe(election_id="Election ID", reason="Reason for reverting certification")
+async def election_uncertify(interaction: discord.Interaction, election_id: str, reason: str):
+    member = await require_fec(interaction)
+    if member is None:
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    pool = await db()
+    election = await fetch_election(pool, election_id)
+    if not election:
+        await interaction.followup.send(f"❌ Election `{election_id}` not found.", ephemeral=True)
+        return
+
+    if (election["status"] or "").upper() != "CERTIFIED":
+        await interaction.followup.send("❌ Election is not CERTIFIED.", ephemeral=True)
+        return
+
+    # Revert status only (keep certification row as a record)
+    await pool.execute("UPDATE elections SET status='CLOSED' WHERE election_id=$1", election_id)
+
+    if interaction.guild:
+        await safe_log_event(interaction.guild, f"⚠️ CERTIFICATION REVERTED: `{election_id}` by <@{interaction.user.id}> — {reason}")
+
+    await interaction.followup.send(
+        f"⚠️ `{election_id}` reverted to CLOSED. Reason logged.",
+        ephemeral=True
+    )
 
 
 # =========================
@@ -1098,31 +1324,8 @@ async def election_report(interaction: discord.Interaction, election_id: str):
         await interaction.response.send_message(f"❌ Election `{election_id}` not found.", ephemeral=True)
         return
 
-    submitted, accepted, pct = await reporting_stats(pool, election_id)
-
-    lines: list[str] = []
-    lines.append(f"**Election:** `{election_id}` ({election['election_type']}) — Status: **{election['status']}**")
-    lines.append(f"**Reporting:** {bar(pct)} **{pct:.1f}%**  (Accepted {accepted} / Submitted {submitted})")
-
-    if election["include_house"]:
-        res, _ = await office_results(pool, election_id, "HOUSE")
-        lines.append("\n**House (Top 3)**")
-        if not res:
-            lines.append("— No accepted votes tallied yet.")
-        else:
-            for label, votes, p in res[:3]:
-                lines.append(f"- {label}: **{votes}** ({p:.1f}%)")
-
-    if election["include_senate"]:
-        res, _ = await office_results(pool, election_id, "SENATE")
-        lines.append("\n**Senate (Top 3)**")
-        if not res:
-            lines.append("— No accepted votes tallied yet.")
-        else:
-            for label, votes, p in res[:3]:
-                lines.append(f"- {label}: **{votes}** ({p:.1f}%)")
-
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    em = await build_results_embed(pool, election)
+    await interaction.response.send_message(embed=em, ephemeral=True)
 
 
 @bot.tree.command(name="election_results", description="Show full results (vote counts + %).")
@@ -1138,12 +1341,12 @@ async def election_results(interaction: discord.Interaction, election_id: str):
 
     lines: list[str] = []
     lines.append(f"📊 **Full Results — `{election_id}`**")
-    lines.append(f"Status: **{election['status']}** | Reporting: {bar(pct)} **{pct:.1f}%** (Accepted {accepted} / Submitted {submitted})")
+    lines.append(f"Status: **{election_status_badge(election['status'])}** | Reporting: {bar(pct)} **{pct:.1f}%** (Accepted {accepted} / Submitted {submitted})")
 
     if election["include_house"]:
         res, _ = await office_results(pool, election_id, "HOUSE")
         lines.append("")
-        lines.append("**House (Full)**")
+        lines.append("**🏛️ House (Full)**")
         if not res:
             lines.append("— No accepted votes tallied yet.")
         else:
@@ -1153,7 +1356,17 @@ async def election_results(interaction: discord.Interaction, election_id: str):
     if election["include_senate"]:
         res, _ = await office_results(pool, election_id, "SENATE")
         lines.append("")
-        lines.append("**Senate (Full)**")
+        lines.append("**🏛️ Senate (Full)**")
+        if not res:
+            lines.append("— No accepted votes tallied yet.")
+        else:
+            for label, votes, p in res:
+                lines.append(f"- {label}: **{votes}** ({p:.1f}%)")
+
+    if election["include_pres"]:
+        res, _ = await office_results(pool, election_id, "PRESIDENT")
+        lines.append("")
+        lines.append("**🇺🇸 President (Full)**")
         if not res:
             lines.append("— No accepted votes tallied yet.")
         else:
@@ -1188,18 +1401,18 @@ async def start_with_backoff():
     if not token:
         raise RuntimeError("DISCORD_TOKEN env var is missing/empty. Add it in Render → Environment.")
 
-    delay = 60  # start backoff at 60s, doubles up to 30 min
+    delay = LOGIN_BACKOFF_START
     while True:
         try:
             await bot.start(token, reconnect=True)
         except discord.HTTPException as e:
             status = getattr(e, "status", None)
+            # Cloudflare 1015 shows up as 429 with HTML body during login
             if status == 429:
-                # Cloudflare 1015 shows up like this (HTML body)
                 sleep_for = delay + random.randint(0, 15)
                 print(f"⚠️ Rate-limited on login (429/Cloudflare). Sleeping {sleep_for}s then retrying...")
                 await asyncio.sleep(sleep_for)
-                delay = min(delay * 2, 30 * 60)
+                delay = min(delay * 2, LOGIN_BACKOFF_CAP)
                 continue
 
             print(f"❌ HTTPException during bot start (status={status}): {e}")
