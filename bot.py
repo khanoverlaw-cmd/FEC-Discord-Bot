@@ -1427,13 +1427,6 @@ async def start_with_backoff():
             traceback.print_exc()
             await asyncio.sleep(60)
 
-        finally:
-            # guarantees aiohttp sessions close
-            try:
-                await bot.close()
-            except Exception:
-                pass
-
 
 if __name__ == "__main__":
     asyncio.run(start_with_backoff())
