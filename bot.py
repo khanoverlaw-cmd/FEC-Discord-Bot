@@ -964,24 +964,22 @@ class VoteView(discord.ui.View):
 
 
 @bot.tree.command(name="vote", description="Cast your ballot (American Citizen role required).")
+@app_commands.describe(election_id="Election ID (e.g. January26)")
 async def vote(interaction: discord.Interaction, election_id: str):
-    await interaction.response.defer(ephemeral=True)
-
     voter = await require_voter(interaction)
     if voter is None:
         return
 
-    pool = await db()
-    election = await fetch_election(pool, election_id)
-    ...
+    # ✅ critical: acknowledge immediately
+    await interaction.response.defer(ephemeral=True)
 
     pool = await db()
     election = await fetch_election(pool, election_id)
     if not election:
-        await interaction.response.send_message(f"❌ Election `{election_id}` not found.", ephemeral=True)
+        await interaction.followup.send(f"❌ Election `{election_id}` not found.", ephemeral=True)
         return
     if (election["status"] or "").upper() != "OPEN":
-        await interaction.response.send_message(f"❌ Polls are not open for `{election_id}`.", ephemeral=True)
+        await interaction.followup.send(f"❌ Polls are not open for `{election_id}`.", ephemeral=True)
         return
 
     rows = await pool.fetch(
@@ -1004,16 +1002,16 @@ async def vote(interaction: discord.Interaction, election_id: str):
             pres_opts.append(opt)
 
     if election["include_house"] and not house_opts:
-        await interaction.response.send_message("❌ Election includes House but has no House candidates.", ephemeral=True)
+        await interaction.followup.send("❌ Election includes House but has no House candidates.", ephemeral=True)
         return
     if election["include_senate"] and not senate_opts:
-        await interaction.response.send_message("❌ Election includes Senate but has no Senate candidates.", ephemeral=True)
+        await interaction.followup.send("❌ Election includes Senate but has no Senate candidates.", ephemeral=True)
         return
     if election["include_pres"] and not pres_opts:
-        await interaction.response.send_message("❌ Election includes President but has no Presidential candidates.", ephemeral=True)
+        await interaction.followup.send("❌ Election includes President but has no Presidential candidates.", ephemeral=True)
         return
     if election["include_pres"] and len(pres_opts) > 25:
-        await interaction.response.send_message("❌ Too many Presidential candidates (>25). Add paging for president or reduce candidates.", ephemeral=True)
+        await interaction.followup.send("❌ Too many Presidential candidates (>25).", ephemeral=True)
         return
 
     description = (
@@ -1025,7 +1023,7 @@ async def vote(interaction: discord.Interaction, election_id: str):
     em = discord.Embed(title="🗳️ Official Ballot", description=description, timestamp=now_utc())
     em.set_footer(text="Federal Elections Commission • Ballot Submission")
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         embed=em,
         view=VoteView(
             election_id=election_id,
