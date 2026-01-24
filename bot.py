@@ -1020,7 +1020,7 @@ class VoteView(discord.ui.View):
                 await interaction.followup.send("❌ DB timed out. Try again in a moment.", ephemeral=True)
                 return
 
-                       if not election:
+            if not election:
                 await interaction.followup.send("❌ Election not found.", ephemeral=True)
                 return
             if (election["status"] or "").upper() != "OPEN":
