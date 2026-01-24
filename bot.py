@@ -24,11 +24,9 @@ BALLOT_CHANNEL_ID = 1464147534887915593  # ballot-counting
 
 RESULTS_CHANNEL_NAME = "election-results"  # auto updates go here by channel name
 
-# Use real channel names (no spaces in Discord channel names)
 ALLOWED_ANNOUNCE_CHANNELS = {"fec-announcements", "election-results", "fec-public-records"}
 
-# Custom emoji tag for header (replace ID with your real emoji id)
-# Tip: in Discord type \:FEC: and copy the output like <:FEC:123...>
+# Custom emoji tag for header (replace with your real emoji id)
 HEADER_PREFIX = "<:FEC:123456789012345678>"
 
 HOUSE_MAX_PICKS = 3
@@ -55,25 +53,14 @@ def fmt_header(title: str) -> str:
 def normalize_message_text(text: str) -> str:
     """
     Bulletproof paragraph breaks:
-    - If Discord strips Shift+Enter newlines in slash command boxes,
-      user can type literal \\n or \\n\\n.
-    - We convert those literal sequences into real newlines.
+    - If Discord strips Shift+Enter newlines, user can type \\n or \\n\\n.
+    - We convert literal sequences into real newlines.
     """
     return text.replace("\\n", "\n")
 
 
 def has_role_id(member: discord.Member, role_id: int) -> bool:
     return any(r.id == role_id for r in member.roles)
-
-
-def unauthorized_notice(case_ref: str) -> str:
-    return (
-        "⚠️ **FEC NOTICE — UNAUTHORIZED ELECTION ACTIVITY**\n\n"
-        "Pursuant to **FEC Administrative Code §1.04(b)**, you are not authorized to issue "
-        "official election communications.\n\n"
-        f"**Case Reference:** `{case_ref}`\n\n"
-        "This action has been logged. Continued attempts may result in administrative review."
-    )
 
 
 def bar(pct: float, width: int = 18) -> str:
@@ -127,20 +114,9 @@ async def safe_log_event(guild: discord.Guild, text: str) -> None:
 
 
 # =========================
-# DISCORD SETUP
+# DB SETUP (robust)
 # =========================
-intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
-
 DB_POOL: Optional[asyncpg.Pool] = None
-DB_READY: bool = False
-STARTUP_ERROR: Optional[str] = None
-
-
-async def db() -> asyncpg.Pool:
-    if DB_POOL is None:
-        raise RuntimeError("DB pool not initialized.")
-    return DB_POOL
 
 
 async def ensure_schema(pool: asyncpg.Pool) -> None:
@@ -187,84 +163,69 @@ async def ensure_schema(pool: asyncpg.Pool) -> None:
     )
 
 
-async def init_db_and_sync() -> None:
+def get_database_url() -> str:
+    raw = (os.getenv("DATABASE_URL") or "").strip()
+    if not raw:
+        raise RuntimeError("DATABASE_URL env var is missing/empty (Render Postgres).")
+    return normalize_db_url(raw)
+
+
+async def ensure_db_pool() -> asyncpg.Pool:
     """
-    IMPORTANT: This must never crash the process.
-    If Postgres is down/misconfigured, we keep the bot online and mark DB_READY=False.
+    Initialize DB pool if needed. Safe to call many times.
     """
-    global DB_POOL, DB_READY, STARTUP_ERROR
+    global DB_POOL
+    if DB_POOL is not None:
+        return DB_POOL
 
-    DB_READY = False
-    STARTUP_ERROR = None
+    dsn = get_database_url()
+    DB_POOL = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=5)
+    await ensure_schema(DB_POOL)
+    return DB_POOL
 
-    database_url = os.getenv("DATABASE_URL")
-    if not database_url:
-        STARTUP_ERROR = "DATABASE_URL env var is missing (Render Postgres)."
-        print(f"⚠️ Startup warning: {STARTUP_ERROR}")
-        return
 
-    try:
-        DB_POOL = await asyncpg.create_pool(
-            dsn=normalize_db_url(database_url),
-            min_size=1,
-            max_size=5,
-        )
-        await ensure_schema(DB_POOL)
+async def db() -> asyncpg.Pool:
+    """
+    DB accessor. If DB was down at startup, we'll retry when a DB command is used.
+    """
+    return await ensure_db_pool()
 
-        # Fast guild sync to avoid "command is outdated"
-        guild_obj = discord.Object(id=DEV_GUILD_ID)
-        bot.tree.copy_global_to(guild=guild_obj)
 
+# =========================
+# DISCORD SETUP (robust sync)
+# =========================
+intents = discord.Intents.default()
+# NOTE: message_content intent is NOT needed for slash commands.
+# The warning is safe to ignore unless you're relying on prefix commands or on_message handlers.
+# If you want to remove the warning, enable MESSAGE CONTENT INTENT in the Developer Portal and set:
+# intents.message_content = True
+
+
+class FECBot(commands.Bot):
+    async def setup_hook(self) -> None:
+        # 1) DB init (do not crash whole bot if DB misconfigured temporarily)
         try:
-            synced = await bot.tree.sync(guild=guild_obj)
+            await ensure_db_pool()
+            print("✅ DB pool initialized.")
+        except Exception as e:
+            print("❌ DB init failed (bot will still start; DB commands may fail until fixed):")
+            traceback.print_exception(type(e), e, e.__traceback__)
+
+        # 2) Sync commands to DEV guild for instant availability
+        try:
+            guild_obj = discord.Object(id=DEV_GUILD_ID)
+            self.tree.copy_global_to(guild=guild_obj)
+            synced = await self.tree.sync(guild=guild_obj)
             print(f"✅ Synced {len(synced)} commands to DEV guild {DEV_GUILD_ID}.")
         except Exception as e:
-            # Sync failure shouldn't kill the bot either.
-            STARTUP_ERROR = f"Slash command sync failed: {type(e).__name__}: {e}"
-            print(f"⚠️ Startup warning: {STARTUP_ERROR}")
+            print("❌ Command sync failed:")
+            traceback.print_exception(type(e), e, e.__traceback__)
 
-        DB_READY = True
-        print("✅ DB_READY=True")
-
-    except Exception as e:
-        STARTUP_ERROR = f"DB init failed: {type(e).__name__}: {e}"
-        print(f"⚠️ Startup warning: {STARTUP_ERROR}")
-        traceback.print_exception(type(e), e, e.__traceback__)
-        DB_READY = False
+    async def on_ready(self):
+        print(f"✅ Logged in as {self.user}")
 
 
-@bot.event
-async def setup_hook():
-    # setup_hook runs once during startup (after login), before on_ready
-    await init_db_and_sync()
-
-
-@bot.event
-async def on_ready():
-    print(f"✅ Logged in as {bot.user} | DB_READY={DB_READY}")
-
-
-def db_not_ready_message() -> str:
-    extra = f"\n\n**Startup error:** {STARTUP_ERROR}" if STARTUP_ERROR else ""
-    return (
-        "⚠️ **Database not ready.**\n"
-        "This bot is online, but Postgres isn’t connected yet.\n\n"
-        "Fix in Render → **Environment**:\n"
-        "- `DATABASE_URL` (Render Postgres connection string)\n"
-        "- (Optional) confirm the Postgres instance is running\n"
-        f"{extra}"
-    )
-
-
-async def require_db_ready(interaction: discord.Interaction) -> bool:
-    if not DB_READY or DB_POOL is None:
-        if interaction.response.is_done():
-            await interaction.followup.send(db_not_ready_message(), ephemeral=True)
-        else:
-            await interaction.response.send_message(db_not_ready_message(), ephemeral=True)
-        return False
-    return True
-
+bot = FECBot(command_prefix="!", intents=intents)
 
 # =========================
 # PERMISSION HELPERS
@@ -362,8 +323,6 @@ async def office_results(pool: asyncpg.Pool, election_id: str, office: str) -> t
 
 
 async def post_auto_update(guild: discord.Guild, election_id: str) -> None:
-    if DB_POOL is None:
-        return
     pool = await db()
     election = await fetch_election(pool, election_id)
     if not election:
@@ -401,7 +360,7 @@ async def post_auto_update(guild: discord.Guild, election_id: str) -> None:
 # =========================
 # ANNOUNCEMENTS UI
 # =========================
-def get_bot_member(guild: discord.Guild) -> discord.Member | None:
+def get_bot_member(guild: discord.Guild) -> Optional[discord.Member]:
     if bot.user is None:
         return None
     return guild.get_member(bot.user.id)
@@ -478,7 +437,7 @@ class AnnounceChannelPicker(discord.ui.View):
 @bot.tree.command(name="announce", description="Post an FEC-formatted announcement to an approved channel.")
 @app_commands.describe(
     title="Announcement title",
-    message="Text. If Shift+Enter fails, type \\n for line breaks, \\n\\n for paragraph breaks."
+    message="Text. Use \\n for line breaks if Shift+Enter fails."
 )
 async def announce(interaction: discord.Interaction, title: str, message: app_commands.Range[str, 1, 4000]):
     member = await require_fec(interaction)
@@ -499,7 +458,7 @@ async def announce(interaction: discord.Interaction, title: str, message: app_co
 
 
 # =========================
-# ELECTION CHOICES (Dropdowns)
+# ELECTION CHOICES
 # =========================
 ELECTION_TYPES = [
     app_commands.Choice(name="Special", value="SPECIAL"),
@@ -531,7 +490,6 @@ STATES = [
     ]
 ]
 
-
 # =========================
 # ELECTION COMMANDS
 # =========================
@@ -554,8 +512,6 @@ async def begin_election(
 ):
     member = await require_fec(interaction)
     if member is None:
-        return
-    if not await require_db_ready(interaction):
         return
 
     pool = await db()
@@ -597,8 +553,6 @@ async def add_candidate(
 ):
     member = await require_fec(interaction)
     if member is None:
-        return
-    if not await require_db_ready(interaction):
         return
 
     pool = await db()
@@ -645,9 +599,6 @@ async def election_open(interaction: discord.Interaction, election_id: str):
     member = await require_fec(interaction)
     if member is None:
         return
-    if not await require_db_ready(interaction):
-        return
-
     pool = await db()
     election = await fetch_election(pool, election_id)
     if not election:
@@ -662,9 +613,6 @@ async def election_close(interaction: discord.Interaction, election_id: str):
     member = await require_fec(interaction)
     if member is None:
         return
-    if not await require_db_ready(interaction):
-        return
-
     pool = await db()
     election = await fetch_election(pool, election_id)
     if not election:
@@ -678,6 +626,9 @@ async def election_close(interaction: discord.Interaction, election_id: str):
 # VOTING UI (Dropdowns)
 # =========================
 class PagedMultiSelect(discord.ui.Select):
+    """
+    Supports >25 options via paging.
+    """
     def __init__(self, placeholder: str, max_picks: int, options: list[discord.SelectOption], on_change):
         self._all_options = options
         self.page = 0
@@ -726,9 +677,6 @@ class VoteView(discord.ui.View):
         self.house_selected: list[int] = []
         self.senate_selected: list[int] = []
 
-        self.house_select: Optional[PagedMultiSelect] = None
-        self.senate_select: Optional[PagedMultiSelect] = None
-
         if include_house:
             async def on_house_change(interaction, values):
                 uniq = []
@@ -738,13 +686,12 @@ class VoteView(discord.ui.View):
                 self.house_selected = uniq[:HOUSE_MAX_PICKS]
                 await interaction.response.send_message("✅ House selections updated.", ephemeral=True)
 
-            self.house_select = PagedMultiSelect(
+            self.add_item(PagedMultiSelect(
                 placeholder=f"House (pick up to {HOUSE_MAX_PICKS})",
                 max_picks=HOUSE_MAX_PICKS,
                 options=house_opts,
                 on_change=on_house_change,
-            )
-            self.add_item(self.house_select)
+            ))
 
         if include_senate:
             async def on_senate_change(interaction, values):
@@ -755,13 +702,12 @@ class VoteView(discord.ui.View):
                 self.senate_selected = uniq[:SENATE_MAX_PICKS]
                 await interaction.response.send_message("✅ Senate selections updated.", ephemeral=True)
 
-            self.senate_select = PagedMultiSelect(
+            self.add_item(PagedMultiSelect(
                 placeholder=f"Senate (pick up to {SENATE_MAX_PICKS})",
                 max_picks=SENATE_MAX_PICKS,
                 options=senate_opts,
                 on_change=on_senate_change,
-            )
-            self.add_item(self.senate_select)
+            ))
 
         self.add_item(self.SubmitButton(self))
 
@@ -773,8 +719,6 @@ class VoteView(discord.ui.View):
         async def callback(self, interaction: discord.Interaction):
             voter = await require_voter(interaction)
             if voter is None:
-                return
-            if not await require_db_ready(interaction):
                 return
 
             pool = await db()
@@ -841,8 +785,6 @@ class VoteView(discord.ui.View):
 async def vote(interaction: discord.Interaction, election_id: str):
     voter = await require_voter(interaction)
     if voter is None:
-        return
-    if not await require_db_ready(interaction):
         return
 
     pool = await db()
@@ -912,8 +854,6 @@ class RejectModal(discord.ui.Modal, title="Reject Ballot"):
         member = await require_fec(interaction)
         if member is None:
             return
-        if not await require_db_ready(interaction):
-            return
 
         pool = await db()
         await pool.execute(
@@ -942,8 +882,6 @@ class ReviewView(discord.ui.View):
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         member = await require_fec(interaction)
         if member is None:
-            return
-        if not await require_db_ready(interaction):
             return
 
         pool = await db()
@@ -976,8 +914,6 @@ class ReviewView(discord.ui.View):
 async def ballots_next(interaction: discord.Interaction, election_id: str):
     member = await require_fec(interaction)
     if member is None:
-        return
-    if not await require_db_ready(interaction):
         return
 
     pool = await db()
@@ -1025,6 +961,7 @@ async def ballots_next(interaction: discord.Interaction, election_id: str):
     )
     embed.add_field(name="Discord Username & ID", value=f"{row['voter_username']} (`{row['voter_id']}`)", inline=False)
     embed.add_field(name="Server Nickname", value=row["voter_nickname"] or "N/A", inline=False)
+
     if row["include_house"]:
         embed.add_field(name="Ballot: House (up to 3)", value=house_text, inline=False)
     if row["include_senate"]:
@@ -1039,9 +976,6 @@ async def ballots_next(interaction: discord.Interaction, election_id: str):
 @bot.tree.command(name="election_report", description="Show reporting % and leaders for an election.")
 @app_commands.describe(election_id="Election ID (e.g. January26)")
 async def election_report(interaction: discord.Interaction, election_id: str):
-    if not await require_db_ready(interaction):
-        return
-
     pool = await db()
     election = await fetch_election(pool, election_id)
     if not election:
@@ -1078,9 +1012,6 @@ async def election_report(interaction: discord.Interaction, election_id: str):
 @bot.tree.command(name="election_results", description="Show full results (vote counts + %).")
 @app_commands.describe(election_id="Election ID (e.g. January26)")
 async def election_results(interaction: discord.Interaction, election_id: str):
-    if not await require_db_ready(interaction):
-        return
-
     pool = await db()
     election = await fetch_election(pool, election_id)
     if not election:
@@ -1134,50 +1065,10 @@ async def ping(interaction: discord.Interaction):
 
 
 # =========================
-# HEALTH / STATUS
+# RUN
 # =========================
-@bot.tree.command(name="status", description="Show bot health + DB connection status.")
-async def status(interaction: discord.Interaction):
-    msg = f"✅ Online.\n**DB_READY:** `{DB_READY}`"
-    if STARTUP_ERROR:
-        msg += f"\n**Startup error:** {STARTUP_ERROR}"
-    await interaction.response.send_message(msg, ephemeral=True)
-
-
-import asyncio
-
-# =========================
-# RUN (avoid Render crash-loop on Discord global 429)
-# =========================
-import sys
-import time
-
 if __name__ == "__main__":
-    token = os.getenv("DISCORD_TOKEN")
+    token = (os.getenv("DISCORD_TOKEN") or "").strip()
     if not token:
-        raise RuntimeError("DISCORD_TOKEN env var is missing. Add it in Render → Environment.")
-
-    backoff = 60          # start at 60s
-    max_backoff = 15 * 60 # cap at 15 minutes
-
-    while True:
-        try:
-            bot.run(token)  # blocks until disconnect / fatal error
-            # If it ever exits cleanly (rare), reset backoff and restart.
-            backoff = 60
-
-        except discord.HTTPException as e:
-            # Discord global rate limit on login
-            if getattr(e, "status", None) == 429:
-                print(f"⚠️ Global rate limit (429). Sleeping {backoff}s to avoid crash-loop...")
-                time.sleep(backoff)
-                backoff = min(backoff * 2, max_backoff)
-
-                # Fresh process so we don't hit "Session is closed"
-                os.execv(sys.executable, [sys.executable] + sys.argv)
-
-            raise  # other HTTP errors should surface
-
-        except Exception as e:
-            print(f"❌ Fatal error: {e}")
-            raise
+        raise RuntimeError("DISCORD_TOKEN env var is missing/empty. Add it in Render → Environment.")
+    bot.run(token)
