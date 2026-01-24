@@ -964,11 +964,16 @@ class VoteView(discord.ui.View):
 
 
 @bot.tree.command(name="vote", description="Cast your ballot (American Citizen role required).")
-@app_commands.describe(election_id="Election ID (e.g. January26)")
 async def vote(interaction: discord.Interaction, election_id: str):
+    await interaction.response.defer(ephemeral=True)
+
     voter = await require_voter(interaction)
     if voter is None:
         return
+
+    pool = await db()
+    election = await fetch_election(pool, election_id)
+    ...
 
     pool = await db()
     election = await fetch_election(pool, election_id)
