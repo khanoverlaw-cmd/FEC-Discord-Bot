@@ -1392,12 +1392,14 @@ async def ping(interaction: discord.Interaction):
 
 
 # =========================
-# RUN (ANTI-RESTART-LOOP BACKOFF)
+# RUN (SAFE BACKOFF)
 # =========================
+import time
+
 LOGIN_BACKOFF_START = 30
 LOGIN_BACKOFF_CAP = 20 * 60
 
-async def start_with_backoff():
+if __name__ == "__main__":
     token = (os.getenv("DISCORD_TOKEN") or "").strip()
     if not token:
         raise RuntimeError("DISCORD_TOKEN env var is missing/empty.")
@@ -1406,29 +1408,27 @@ async def start_with_backoff():
 
     while True:
         try:
-            print("🔐 Attempting Discord login...")
-            await bot.start(token, reconnect=True)
-            print("🛑 bot.start() returned unexpectedly; restarting soon.")
+            print("🔐 Starting bot via bot.run() ...")
+            bot.run(token)  # handles event loop + aiohttp session cleanly
+            print("🛑 bot.run() returned (unexpected). Restarting soon...")
             delay = LOGIN_BACKOFF_START
-            await asyncio.sleep(15)
+            time.sleep(10)
 
         except discord.HTTPException as e:
             status = getattr(e, "status", None)
             if status == 429:
                 sleep_for = delay + random.randint(0, 15)
-                print(f"⚠️ Login rate-limited (429). Sleeping {sleep_for}s then retrying.")
-                await asyncio.sleep(sleep_for)
+                print(f"⚠️ Rate limited (429). Sleeping {sleep_for}s then retrying.")
+                time.sleep(sleep_for)
                 delay = min(delay * 2, LOGIN_BACKOFF_CAP)
                 continue
 
-            print(f"❌ HTTPException during login (status={status}): {repr(e)}")
-            traceback.print_exc()
-            await asyncio.sleep(60)
+            print(f"❌ HTTPException (status={status}): {repr(e)}")
+            time.sleep(60)
 
         except Exception as e:
-            print("🔥 Fatal exception during bot.start:", repr(e))
-            traceback.print_exc()
-            await asyncio.sleep(60)
+            print(f"🔥 Fatal exception: {repr(e)}")
+            time.sleep(60)
 
 
 if __name__ == "__main__":
