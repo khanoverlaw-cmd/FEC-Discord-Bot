@@ -264,6 +264,21 @@ class FECBot(commands.Bot):
 
 bot = FECBot(command_prefix=None, intents=intents)
 
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    # Always print the traceback to Render logs
+    print("❌ App command error:", repr(error))
+    traceback.print_exception(type(error), error, error.__traceback__)
+
+    # Try to notify the user (without double-responding)
+    msg = "❌ Something broke while running that command. The error was logged."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
 
 # =========================
 # PERMISSIONS
@@ -963,9 +978,19 @@ class VoteView(discord.ui.View):
             self.parent.stop()
 
 
-@bot.tree.command(name="vote", description="Cast your ballot (American Citizen role required).")
-@app_commands.describe(election_id="Election ID (e.g. January26)")
-async def vote(interaction: discord.Interaction, election_id: str):
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    print("❌ App command error:", repr(error))
+    traceback.print_exception(type(error), error, error.__traceback__)
+
+    msg = "❌ Something broke while running that command. The error was logged."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
     voter = await require_voter(interaction)
     if voter is None:
         return
