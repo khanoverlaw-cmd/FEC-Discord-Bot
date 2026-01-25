@@ -362,7 +362,7 @@ class FECBot(commands.Bot):
             pass
         await super().close()
 
-bot = FECBot(command_prefix=None, intents=intents)
+bot = FECBot(command_prefix="!", intents=intents)
 
 
 @bot.tree.error
