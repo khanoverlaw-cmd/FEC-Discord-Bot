@@ -1,4 +1,3 @@
-# bot.py
 import os
 import random
 import traceback
@@ -742,6 +741,10 @@ async def begin_election(
         await interaction.response.send_message(f"❌ Election `{election_id}` already exists.", ephemeral=True)
     except asyncio.TimeoutError:
         await interaction.response.send_message("❌ DB timed out creating election. Try again.", ephemeral=True)
+    except Exception as e:
+        log.error("❌ Failed to create election %s: %s", election_id, e)
+        traceback.print_exception(type(e), e, e.__traceback__)
+        await interaction.response.send_message("❌ Failed to create election (logged).", ephemeral=True)
 
 @bot.tree.command(name="add_candidate", description="(FEC) Add a candidate to an election.")
 @app_commands.choices(office=OFFICES, party=PARTIES)
@@ -805,6 +808,32 @@ async def add_candidate(
             """,
             election_id, off, rp_name, party_val, state_val, district
         ))
+        em = discord.Embed(
+            title="✅ Candidate Registered",
+            description=(
+                f"**Election:** `{election_id}`\n"
+                f"**Office:** {office_badge(off)}\n"
+                f"**Candidate:** {candidate_label(off, rp_name, party_val, state_val, district)}\n"
+                f"**Candidate ID:** `{row['candidate_id']}`"
+            ),
+            timestamp=now_utc()
+        )
+        await interaction.response.send_message(embed=em, ephemeral=True)
+    except asyncpg.UniqueViolationError:
+        await interaction.response.send_message("❌ That candidate already exists for this election/office.", ephemeral=True)
+    except asyncio.TimeoutError:
+        await interaction.response.send_message("❌ DB timed out adding candidate. Try again.", ephemeral=True)
+    except Exception as e:
+        log.error("❌ Failed to add candidate for election %s: %s", election_id, e)
+        traceback.print_exception(type(e), e, e.__traceback__)
+        await interaction.response.send_message("❌ Failed to add candidate (logged).", ephemeral=True)
+
+
+@bot.tree.command(name="election_open", description="(FEC) Open polls for an election.")
+async def election_open(interaction: discord.Interaction, election_id: str):
+    member = await require_fec(interaction)
+    if member is None:
+        return
     try:
         pool = await db()
         election = await fetch_election(pool, election_id)
@@ -828,48 +857,34 @@ async def add_candidate(
         traceback.print_exception(type(e), e, e.__traceback__)
         await interaction.response.send_message("❌ Failed to open election (logged).", ephemeral=True)
 
-@bot.tree.command(name="election_open", description="(FEC) Open polls for an election.")
-async def election_open(interaction: discord.Interaction, election_id: str):
-    member = await require_fec(interaction)
-    if member is None:
-        return
-    pool = await db()
-    election = await fetch_election(pool, election_id)
-    if not election:
-        await interaction.response.send_message(f"❌ Election `{election_id}` not found.", ephemeral=True)
-        return
-    if (election["status"] or "").upper() == "CERTIFIED":
-        await interaction.response.send_message("❌ Election is CERTIFIED; cannot reopen.", ephemeral=True)
-        return
-    if election["status"] == "OPEN":
-        await interaction.response.send_message(f"✅ `{election_id}` is already OPEN.", ephemeral=True)
-        return
-    await db_call(pool.execute("UPDATE elections SET status='OPEN' WHERE election_id=$1", election_id))
-    await interaction.response.send_message(f"🟢 Polls OPEN for `{election_id}`.", ephemeral=True)
-    if interaction.guild:
-        await post_or_edit_auto_update(interaction.guild, election_id)
-
 
 @bot.tree.command(name="election_close", description="(FEC) Close polls for an election.")
 async def election_close(interaction: discord.Interaction, election_id: str):
     member = await require_fec(interaction)
     if member is None:
         return
-    pool = await db()
-    election = await fetch_election(pool, election_id)
-    if not election:
-        await interaction.response.send_message(f"❌ Election `{election_id}` not found.", ephemeral=True)
-        return
-    if (election["status"] or "").upper() == "CERTIFIED":
-        await interaction.response.send_message("❌ Election is CERTIFIED; cannot change status.", ephemeral=True)
-        return
-    if election["status"] == "CLOSED":
-        await interaction.response.send_message(f"✅ `{election_id}` is already CLOSED.", ephemeral=True)
-        return
-    await db_call(pool.execute("UPDATE elections SET status='CLOSED' WHERE election_id=$1", election_id))
-    await interaction.response.send_message(f"🔴 Polls CLOSED for `{election_id}`.", ephemeral=True)
-    if interaction.guild:
-        await post_or_edit_auto_update(interaction.guild, election_id)
+    try:
+        pool = await db()
+        election = await fetch_election(pool, election_id)
+        if not election:
+            await interaction.response.send_message(f"❌ Election `{election_id}` not found.", ephemeral=True)
+            return
+        if (election["status"] or "").upper() == "CERTIFIED":
+            await interaction.response.send_message("❌ Election is CERTIFIED; cannot change status.", ephemeral=True)
+            return
+        if election["status"] == "CLOSED":
+            await interaction.response.send_message(f"✅ `{election_id}` is already CLOSED.", ephemeral=True)
+            return
+        await db_call(pool.execute("UPDATE elections SET status='CLOSED' WHERE election_id=$1", election_id))
+        await interaction.response.send_message(f"🔴 Polls CLOSED for `{election_id}`.", ephemeral=True)
+        if interaction.guild:
+            await post_or_edit_auto_update(interaction.guild, election_id)
+    except asyncio.TimeoutError:
+        await interaction.response.send_message("❌ DB timed out closing election. Try again.", ephemeral=True)
+    except Exception as e:
+        log.error("❌ Failed to close election %s: %s", election_id, e)
+        traceback.print_exception(type(e), e, e.__traceback__)
+        await interaction.response.send_message("❌ Failed to close election (logged).", ephemeral=True)
 
 
 # =========================
@@ -1135,7 +1150,7 @@ class VoteView(discord.ui.View):
                 ephemeral=True
             )
             self.parent.stop()
-            
+
 @bot.tree.command(name="vote", description="Cast your ballot for an OPEN election.")
 @app_commands.describe(election_id="Election ID (e.g. January26)")
 async def vote(interaction: discord.Interaction, election_id: str):
@@ -1230,7 +1245,7 @@ async def vote(interaction: discord.Interaction, election_id: str):
         f"House max: **{HOUSE_MAX_PICKS}** • Senate max: **{SENATE_MAX_PICKS}**"
     ]
     await interaction.followup.send("\n".join(msg_lines), view=view, ephemeral=True)
-    
+
 # =========================
 # BALLOT REVIEW (FEC)
 # =========================
@@ -1543,7 +1558,7 @@ async def main():
     if not token:
         raise RuntimeError("DISCORD_TOKEN env var missing.")
 
-health_runner = await start_health_server()
+    health_runner = await start_health_server()
     try:
         async with bot:
             await bot.start(token)
