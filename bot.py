@@ -13,6 +13,7 @@ from discord.ext import commands
 from discord import app_commands
 
 import asyncpg
+from aiohttp import web
 
 # =========================
 # LOGGING
@@ -288,6 +289,27 @@ async def ensure_db_pool() -> asyncpg.Pool:
 
 async def db() -> asyncpg.Pool:
     return await ensure_db_pool()
+
+
+async def start_health_server() -> Optional[web.AppRunner]:
+    port_str = (os.getenv("PORT") or "").strip()
+    if not port_str:
+        return None
+
+    app = web.Application()
+
+    async def handle_health(_request: web.Request) -> web.Response:
+        return web.Response(text="OK")
+
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(port_str))
+    await site.start()
+    log.info("✅ Health server running on port %s", port_str)
+    return runner
 
 
 # =========================
@@ -783,22 +805,28 @@ async def add_candidate(
             """,
             election_id, off, rp_name, party_val, state_val, district
         ))
-        em = discord.Embed(
-            title="✅ Candidate Registered",
-            description=(
-                f"**Election:** `{election_id}`\n"
-                f"**Office:** {office_badge(off)}\n"
-                f"**Candidate:** {candidate_label(off, rp_name, party_val, state_val, district)}\n"
-                f"**Candidate ID:** `{row['candidate_id']}`"
-            ),
-            timestamp=now_utc()
-        )
-        await interaction.response.send_message(embed=em, ephemeral=True)
-    except asyncpg.UniqueViolationError:
-        await interaction.response.send_message("❌ That candidate already exists for this election/office.", ephemeral=True)
+    try:
+        pool = await db()
+        election = await fetch_election(pool, election_id)
+        if not election:
+            await interaction.response.send_message(f"❌ Election `{election_id}` not found.", ephemeral=True)
+            return
+        if (election["status"] or "").upper() == "CERTIFIED":
+            await interaction.response.send_message("❌ Election is CERTIFIED; cannot reopen.", ephemeral=True)
+            return
+        if election["status"] == "OPEN":
+            await interaction.response.send_message(f"✅ `{election_id}` is already OPEN.", ephemeral=True)
+            return
+        await db_call(pool.execute("UPDATE elections SET status='OPEN' WHERE election_id=$1", election_id))
+        await interaction.response.send_message(f"🟢 Polls OPEN for `{election_id}`.", ephemeral=True)
+        if interaction.guild:
+            await post_or_edit_auto_update(interaction.guild, election_id)
     except asyncio.TimeoutError:
-        await interaction.response.send_message("❌ DB timed out adding candidate. Try again.", ephemeral=True)
-
+        await interaction.response.send_message("❌ DB timed out opening election. Try again.", ephemeral=True)
+    except Exception as e:
+        log.error("❌ Failed to open election %s: %s", election_id, e)
+        traceback.print_exception(type(e), e, e.__traceback__)
+        await interaction.response.send_message("❌ Failed to open election (logged).", ephemeral=True)
 
 @bot.tree.command(name="election_open", description="(FEC) Open polls for an election.")
 async def election_open(interaction: discord.Interaction, election_id: str):
@@ -1515,8 +1543,13 @@ async def main():
     if not token:
         raise RuntimeError("DISCORD_TOKEN env var missing.")
 
-    async with bot:
-        await bot.start(token)
+health_runner = await start_health_server()
+    try:
+        async with bot:
+            await bot.start(token)
+    finally:
+        if health_runner:
+            await health_runner.cleanup()
 
 if __name__ == "__main__":
     asyncio.run(main())
