@@ -905,30 +905,66 @@ async def election_close(interaction: discord.Interaction, election_id: str):
 # VOTING UI (dropdowns + paging)
 # =========================
 class PagedMultiSelect(discord.ui.Select):
-    def __init__(self, placeholder: str, max_picks: int, options: list[discord.SelectOption], on_change):
+    def __init__(
+        self,
+        placeholder: str,
+        max_picks: int,
+        options: list[discord.SelectOption],
+        get_selected_ids,
+        set_selected_ids,
+        on_change=None,
+    ):
         self._all_options = options
         self.page = 0
         self.max_picks = max_picks
+        self._base_placeholder = placeholder
+
+        self.get_selected_ids = get_selected_ids
+        self.set_selected_ids = set_selected_ids
         self.on_change = on_change
 
         page_opts = self._page_options()
         super().__init__(
-            placeholder=placeholder,
+            placeholder=self._render_placeholder(),
             min_values=0,
             max_values=min(max_picks, len(page_opts)) if page_opts else 0,
             options=page_opts,
         )
+        self._sync_defaults_for_page()
+
+    def _render_placeholder(self) -> str:
+        selected = self.get_selected_ids()
+        return f"{self._base_placeholder} • selected {len(selected)}/{self.max_picks}"
 
     def _page_options(self) -> list[discord.SelectOption]:
         start = self.page * MAX_SELECT_OPTIONS
         end = start + MAX_SELECT_OPTIONS
         return self._all_options[start:end]
 
+    def _page_option_ids(self) -> set[int]:
+        ids: set[int] = set()
+        for o in self._page_options():
+            try:
+                ids.add(int(o.value))
+            except Exception:
+                pass
+        return ids
+
+    def _sync_defaults_for_page(self) -> None:
+        selected = self.get_selected_ids()
+        for opt in self.options:
+            try:
+                opt.default = (int(opt.value) in selected)
+            except Exception:
+                opt.default = False
+
     def set_page(self, page: int):
         self.page = max(0, min(page, self.total_pages() - 1))
         page_opts = self._page_options()
         self.options = page_opts
         self.max_values = min(self.max_picks, len(page_opts)) if page_opts else 0
+        self.placeholder = self._render_placeholder()
+        self._sync_defaults_for_page()
 
     def total_pages(self) -> int:
         if not self._all_options:
@@ -936,9 +972,40 @@ class PagedMultiSelect(discord.ui.Select):
         return ((len(self._all_options) - 1) // MAX_SELECT_OPTIONS) + 1
 
     async def callback(self, interaction: discord.Interaction):
-        # Avoid "thinking too long" in UI callbacks
         await safe_defer(interaction, ephemeral=True)
-        await self.on_change(interaction, [int(v) for v in self.values])
+
+        selected = set(self.get_selected_ids())
+        page_ids = self._page_option_ids()
+        page_selected_now = {int(v) for v in self.values}
+
+        selected -= (page_ids - page_selected_now)
+        selected |= page_selected_now
+
+        if len(selected) > self.max_picks:
+            ordered = []
+            for opt in self._all_options:
+                try:
+                    cid = int(opt.value)
+                except Exception:
+                    continue
+                if cid in selected:
+                    ordered.append(cid)
+            selected = set(ordered[: self.max_picks])
+
+        self.set_selected_ids(selected)
+        self.placeholder = self._render_placeholder()
+        self._sync_defaults_for_page()
+
+        if self.on_change:
+            try:
+                await self.on_change(interaction, sorted(selected))
+            except Exception:
+                pass
+
+        try:
+            await interaction.edit_original_response(view=self.view)
+        except Exception:
+            pass
 
 
 class VoteView(discord.ui.View):
@@ -954,8 +1021,8 @@ class VoteView(discord.ui.View):
     ):
         super().__init__(timeout=300)
         self.election_id = election_id
-        self.house_selected: list[int] = []
-        self.senate_selected: list[int] = []
+        self.house_selected: set[int] = set()
+        self.senate_selected: set[int] = set()
         self.pres_selected: Optional[int] = None
 
         self.house_select: Optional[PagedMultiSelect] = None
@@ -963,17 +1030,15 @@ class VoteView(discord.ui.View):
         self.pres_select: Optional[discord.ui.Select] = None
 
         if include_house:
-            async def on_house_change(_interaction, values):
-                uniq: list[int] = []
-                for v in values:
-                    if v not in uniq:
-                        uniq.append(v)
-                self.house_selected = uniq[:HOUSE_MAX_PICKS]
+            async def on_house_change(_interaction, values: list[int]):
+                pass
 
             self.house_select = PagedMultiSelect(
                 placeholder=f"House (pick up to {HOUSE_MAX_PICKS})",
                 max_picks=HOUSE_MAX_PICKS,
                 options=house_opts,
+                get_selected_ids=lambda: self.house_selected,
+                set_selected_ids=lambda s: setattr(self, "house_selected", s),
                 on_change=on_house_change,
             )
             self.add_item(self.house_select)
@@ -981,17 +1046,15 @@ class VoteView(discord.ui.View):
             self.add_item(self.HouseNextButton(self))
 
         if include_senate:
-            async def on_senate_change(_interaction, values):
-                uniq: list[int] = []
-                for v in values:
-                    if v not in uniq:
-                        uniq.append(v)
-                self.senate_selected = uniq[:SENATE_MAX_PICKS]
+            async def on_senate_change(_interaction, values: list[int]):
+                pass
 
             self.senate_select = PagedMultiSelect(
                 placeholder=f"Senate (pick up to {SENATE_MAX_PICKS})",
                 max_picks=SENATE_MAX_PICKS,
                 options=senate_opts,
+                get_selected_ids=lambda: self.senate_selected,
+                set_selected_ids=lambda s: setattr(self, "senate_selected", s),
                 on_change=on_senate_change,
             )
             self.add_item(self.senate_select)
@@ -1029,7 +1092,10 @@ class VoteView(discord.ui.View):
                 await safe_defer(interaction, ephemeral=True)
                 return
             self.parent.house_select.set_page(self.parent.house_select.page - 1)
-            await interaction.response.edit_message(view=self.parent)
+            try:
+                await interaction.response.edit_message(view=self.parent)
+            except discord.InteractionResponded:
+                await interaction.edit_original_response(view=self.parent)
 
     class HouseNextButton(discord.ui.Button):
         def __init__(self, parent: "VoteView"):
@@ -1041,7 +1107,10 @@ class VoteView(discord.ui.View):
                 await safe_defer(interaction, ephemeral=True)
                 return
             self.parent.house_select.set_page(self.parent.house_select.page + 1)
-            await interaction.response.edit_message(view=self.parent)
+            try:
+                await interaction.response.edit_message(view=self.parent)
+            except discord.InteractionResponded:
+                await interaction.edit_original_response(view=self.parent)
 
     class SenatePrevButton(discord.ui.Button):
         def __init__(self, parent: "VoteView"):
@@ -1053,7 +1122,10 @@ class VoteView(discord.ui.View):
                 await safe_defer(interaction, ephemeral=True)
                 return
             self.parent.senate_select.set_page(self.parent.senate_select.page - 1)
-            await interaction.response.edit_message(view=self.parent)
+            try:
+                await interaction.response.edit_message(view=self.parent)
+            except discord.InteractionResponded:
+                await interaction.edit_original_response(view=self.parent)
 
     class SenateNextButton(discord.ui.Button):
         def __init__(self, parent: "VoteView"):
@@ -1065,7 +1137,10 @@ class VoteView(discord.ui.View):
                 await safe_defer(interaction, ephemeral=True)
                 return
             self.parent.senate_select.set_page(self.parent.senate_select.page + 1)
-            await interaction.response.edit_message(view=self.parent)
+            try:
+                await interaction.response.edit_message(view=self.parent)
+            except discord.InteractionResponded:
+                await interaction.edit_original_response(view=self.parent)
 
     class SubmitButton(discord.ui.Button):
         def __init__(self, parent: "VoteView"):
@@ -1118,8 +1193,8 @@ class VoteView(discord.ui.View):
                         interaction.user.id,
                         voter_username,
                         voter_nick,
-                        self.parent.house_selected,
-                        self.parent.senate_selected,
+                        sorted(self.parent.house_selected),
+                        sorted(self.parent.senate_selected),
                         self.parent.pres_selected,
                     ),
                     timeout=10,
