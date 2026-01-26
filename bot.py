@@ -161,6 +161,19 @@ async def safe_defer(interaction: discord.Interaction, ephemeral: bool = True) -
         pass
 
 
+async def safe_ephemeral_message(interaction: discord.Interaction, message: str) -> None:
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.NotFound:
+        # Interaction expired or already acknowledged by Discord.
+        pass
+    except Exception:
+        pass
+
+
 async def db_call(coro):
     """
     Wrap DB ops with a timeout so we don't silently hang and hit "thinking too long".
@@ -834,28 +847,29 @@ async def election_open(interaction: discord.Interaction, election_id: str):
     member = await require_fec(interaction)
     if member is None:
         return
+    await safe_defer(interaction, ephemeral=True)
     try:
         pool = await db()
         election = await fetch_election(pool, election_id)
         if not election:
-            await interaction.response.send_message(f"❌ Election `{election_id}` not found.", ephemeral=True)
+            await safe_ephemeral_message(interaction, f"❌ Election `{election_id}` not found.")
             return
         if (election["status"] or "").upper() == "CERTIFIED":
-            await interaction.response.send_message("❌ Election is CERTIFIED; cannot reopen.", ephemeral=True)
+            await safe_ephemeral_message(interaction, "❌ Election is CERTIFIED; cannot reopen.")
             return
         if election["status"] == "OPEN":
-            await interaction.response.send_message(f"✅ `{election_id}` is already OPEN.", ephemeral=True)
+            await safe_ephemeral_message(interaction, f"✅ `{election_id}` is already OPEN.")
             return
         await db_call(pool.execute("UPDATE elections SET status='OPEN' WHERE election_id=$1", election_id))
-        await interaction.response.send_message(f"🟢 Polls OPEN for `{election_id}`.", ephemeral=True)
+        await safe_ephemeral_message(interaction, f"🟢 Polls OPEN for `{election_id}`.")
         if interaction.guild:
             await post_or_edit_auto_update(interaction.guild, election_id)
     except asyncio.TimeoutError:
-        await interaction.response.send_message("❌ DB timed out opening election. Try again.", ephemeral=True)
+        await safe_ephemeral_message(interaction, "❌ DB timed out opening election. Try again.")
     except Exception as e:
         log.error("❌ Failed to open election %s: %s", election_id, e)
         traceback.print_exception(type(e), e, e.__traceback__)
-        await interaction.response.send_message("❌ Failed to open election (logged).", ephemeral=True)
+        await safe_ephemeral_message(interaction, "❌ Failed to open election (logged).")
 
 
 @bot.tree.command(name="election_close", description="(FEC) Close polls for an election.")
@@ -1547,7 +1561,8 @@ async def election_report(interaction: discord.Interaction, election_id: str):
 
 @bot.tree.command(name="ping", description="Check if the bot is online.")
 async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("✅ Online.", ephemeral=True)
+    await safe_defer(interaction, ephemeral=True)
+    await safe_ephemeral_message(interaction, "✅ Online.")
 
 
 # =========================
