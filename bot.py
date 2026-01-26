@@ -1,3 +1,4 @@
+# bot.py
 import os
 import random
 import traceback
@@ -782,15 +783,16 @@ async def add_candidate(
     member = await require_fec(interaction)
     if member is None:
         return
+    await safe_defer(interaction, ephemeral=True)
 
     pool = await db()
     election = await fetch_election(pool, election_id)
     if not election:
-        await interaction.response.send_message(f"❌ Election `{election_id}` not found.", ephemeral=True)
+        await safe_ephemeral_message(interaction, f"❌ Election `{election_id}` not found.")
         return
 
     if (election["status"] or "").upper() == "CERTIFIED":
-        await interaction.response.send_message("❌ Election is CERTIFIED; candidates cannot be modified.", ephemeral=True)
+        await safe_ephemeral_message(interaction, "❌ Election is CERTIFIED; candidates cannot be modified.")
         return
 
     off = office.value
@@ -799,15 +801,15 @@ async def add_candidate(
 
     if off in ("HOUSE", "SENATE"):
         if not state_val:
-            await interaction.response.send_message("❌ State is required for House/Senate candidates.", ephemeral=True)
+            await safe_ephemeral_message(interaction, "❌ State is required for House/Senate candidates.")
             return
         if state_val not in STATE_CODES:
-            await interaction.response.send_message("❌ Invalid state. Use a 2-letter code like TX, CA, LA.", ephemeral=True)
+            await safe_ephemeral_message(interaction, "❌ Invalid state. Use a 2-letter code like TX, CA, LA.")
             return
 
     if off == "HOUSE":
         if district is None or district < 1:
-            await interaction.response.send_message("❌ District is required for House candidates.", ephemeral=True)
+            await safe_ephemeral_message(interaction, "❌ District is required for House candidates.")
             return
     else:
         district = None
@@ -831,15 +833,18 @@ async def add_candidate(
             ),
             timestamp=now_utc()
         )
-        await interaction.response.send_message(embed=em, ephemeral=True)
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=em, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=em, ephemeral=True)
     except asyncpg.UniqueViolationError:
-        await interaction.response.send_message("❌ That candidate already exists for this election/office.", ephemeral=True)
+        await safe_ephemeral_message(interaction, "❌ That candidate already exists for this election/office.")
     except asyncio.TimeoutError:
-        await interaction.response.send_message("❌ DB timed out adding candidate. Try again.", ephemeral=True)
+        await safe_ephemeral_message(interaction, "❌ DB timed out adding candidate. Try again.")
     except Exception as e:
         log.error("❌ Failed to add candidate for election %s: %s", election_id, e)
         traceback.print_exception(type(e), e, e.__traceback__)
-        await interaction.response.send_message("❌ Failed to add candidate (logged).", ephemeral=True)
+        await safe_ephemeral_message(interaction, "❌ Failed to add candidate (logged).")
 
 
 @bot.tree.command(name="election_open", description="(FEC) Open polls for an election.")
@@ -1085,62 +1090,62 @@ class VoteView(discord.ui.View):
     class HousePrevButton(discord.ui.Button):
         def __init__(self, parent: "VoteView"):
             super().__init__(label="◀ House Prev", style=discord.ButtonStyle.secondary)
-            self.parent = parent
+            self.view_ref = parent
 
         async def callback(self, interaction: discord.Interaction):
-            if not self.parent.house_select:
+            if not self.view_ref.house_select:
                 await safe_defer(interaction, ephemeral=True)
                 return
-            self.parent.house_select.set_page(self.parent.house_select.page - 1)
+            self.view_ref.house_select.set_page(self.view_ref.house_select.page - 1)
             try:
-                await interaction.response.edit_message(view=self.parent)
+                await interaction.response.edit_message(view=self.view_ref)
             except discord.InteractionResponded:
-                await interaction.edit_original_response(view=self.parent)
+                await interaction.edit_original_response(view=self.view_ref)
 
     class HouseNextButton(discord.ui.Button):
         def __init__(self, parent: "VoteView"):
             super().__init__(label="House Next ▶", style=discord.ButtonStyle.secondary)
-            self.parent = parent
+            self.view_ref = parent
 
         async def callback(self, interaction: discord.Interaction):
-            if not self.parent.house_select:
+            if not self.view_ref.house_select:
                 await safe_defer(interaction, ephemeral=True)
                 return
-            self.parent.house_select.set_page(self.parent.house_select.page + 1)
+            self.view_ref.house_select.set_page(self.view_ref.house_select.page + 1)
             try:
-                await interaction.response.edit_message(view=self.parent)
+                await interaction.response.edit_message(view=self.view_ref)
             except discord.InteractionResponded:
-                await interaction.edit_original_response(view=self.parent)
+                await interaction.edit_original_response(view=self.view_ref)
 
     class SenatePrevButton(discord.ui.Button):
         def __init__(self, parent: "VoteView"):
             super().__init__(label="◀ Senate Prev", style=discord.ButtonStyle.secondary)
-            self.parent = parent
+            self.view_ref = parent
 
         async def callback(self, interaction: discord.Interaction):
-            if not self.parent.senate_select:
+            if not self.view_ref.senate_select:
                 await safe_defer(interaction, ephemeral=True)
                 return
-            self.parent.senate_select.set_page(self.parent.senate_select.page - 1)
+            self.view_ref.senate_select.set_page(self.view_ref.senate_select.page - 1)
             try:
-                await interaction.response.edit_message(view=self.parent)
+                await interaction.response.edit_message(view=self.view_ref)
             except discord.InteractionResponded:
-                await interaction.edit_original_response(view=self.parent)
+                await interaction.edit_original_response(view=self.view_ref)
 
     class SenateNextButton(discord.ui.Button):
         def __init__(self, parent: "VoteView"):
             super().__init__(label="Senate Next ▶", style=discord.ButtonStyle.secondary)
-            self.parent = parent
+            self.view_ref = parent
 
         async def callback(self, interaction: discord.Interaction):
-            if not self.parent.senate_select:
+            if not self.view_ref.senate_select:
                 await safe_defer(interaction, ephemeral=True)
                 return
-            self.parent.senate_select.set_page(self.parent.senate_select.page + 1)
+            self.view_ref.senate_select.set_page(self.view_ref.senate_select.page + 1)
             try:
-                await interaction.response.edit_message(view=self.parent)
+                await interaction.response.edit_message(view=self.view_ref)
             except discord.InteractionResponded:
-                await interaction.edit_original_response(view=self.parent)
+                await interaction.edit_original_response(view=self.view_ref)
 
     class SubmitButton(discord.ui.Button):
         def __init__(self, parent: "VoteView"):
@@ -1239,7 +1244,7 @@ class VoteView(discord.ui.View):
                 ephemeral=True
             )
             self.parent.stop()
-
+            
 @bot.tree.command(name="vote", description="Cast your ballot for an OPEN election.")
 @app_commands.describe(election_id="Election ID (e.g. January26)")
 async def vote(interaction: discord.Interaction, election_id: str):
@@ -1334,7 +1339,7 @@ async def vote(interaction: discord.Interaction, election_id: str):
         f"House max: **{HOUSE_MAX_PICKS}** • Senate max: **{SENATE_MAX_PICKS}**"
     ]
     await interaction.followup.send("\n".join(msg_lines), view=view, ephemeral=True)
-
+    
 # =========================
 # BALLOT REVIEW (FEC)
 # =========================
